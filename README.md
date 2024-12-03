@@ -19,9 +19,9 @@
 
 ## News
 
-- [11/26/2024] 📋 I am trying my best to re-implement the code and re-train the model as soon as I can. I plan to release the code before 12/09/2024 and the models afterwards. I am going to make my clusters running so fiecely that they will warm up the whole Illinois during this winter. 🔥🔥🔥
+- [12/02/2024] 📋 I am trying my best to re-implement the code and re-train the model as soon as I can. I plan to release the code before 12/09/2024 and the models afterwards. I am going to make my clusters running so fiecely that they will warm up the whole Illinois during this winter. 🔥🔥🔥
 
-- [11/26/2024] 🎉 The paper appears on Arxiv.
+- [12/02/2024] 🎉 The paper appears on Arxiv.
 
 ## Citation
 
