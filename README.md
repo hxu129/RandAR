@@ -9,6 +9,8 @@
 
 ## Overview
 
+Ever thinking about what is the prerequisite for a visual model achieving the impact of GPT in language? The prequisite should be its ability of zero-shot generalization to various applications, prompts, etc. Our RandAR is one of the attempts towards this objective.
+
 🎲 **RandAR** is a decoder-only AR model generating image tokens in arbitrary orders. 
 
 🚀 **RandAR** supports parallel-decoding without additional fine-tuning and brings 2.5 $\times$ acceleration for AR generation.
@@ -19,9 +21,15 @@
 
 ## News
 
+- [12/09/2024] 🎉 The initial code is released, including the tokenization/modeling/training pipeline. I found that augmentation & tokenization different from the LLaMAGEN's designs are better for FID. From the current speed of training, I expect to release model checkpoints and verified training/eval scripts before 12/18/2024.
+
 - [12/02/2024] 📋 I am trying my best to re-implement the code and re-train the model as soon as I can. I plan to release the code before 12/09/2024 and the models afterwards. I am going to make my clusters running so fiecely that they will warm up the whole Illinois during this winter. 🔥🔥🔥
 
 - [12/02/2024] 🎉 The paper appears on Arxiv.
+
+## Getting Started
+
+Checkout our documentation [DOCUMENTATION.md](documantation.md) for more details.
 
 ## Citation
 

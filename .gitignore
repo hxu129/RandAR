@@ -1,3 +1,16 @@
+checkpoints/*
+results/*
+wandb/*
+logs/*
+samples/*
+slurm_logs/*
+
+checkpoints/
+results/
+
+checkpoints
+results
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
