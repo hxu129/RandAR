@@ -21,6 +21,8 @@ Ever thinking about what is the prerequisite for a visual model achieving the im
 
 ## News
 
+- [12/29/2024] 🎉 We release example checkpoints for RandAR. We are continuing to train more models and release the code supporting the diverse zero-shot tasks by 1/09/2025.
+
 - [12/09/2024] 🎉 The initial code is released, including the tokenization/modeling/training pipeline. I found that augmentation & tokenization different from the LLaMAGEN's designs are better for FID. From the current speed of training, I expect to release model checkpoints and verified training/eval scripts before 12/18/2024.
 
 - [12/02/2024] 📋 I am trying my best to re-implement the code and re-train the model as soon as I can. I plan to release the code before 12/09/2024 and the models afterwards. I am going to make my clusters running so fiecely that they will warm up the whole Illinois during this winter. 🔥🔥🔥
@@ -30,6 +32,25 @@ Ever thinking about what is the prerequisite for a visual model achieving the im
 ## Getting Started
 
 Checkout our documentation [DOCUMENTATION.md](documantation.md) for more details.
+
+## Pre-trained Models
+
+We have tried slightly modified (1) tokenizer: using either MaskGIT's or LLaMAGen's tokenizer, (2) learning rate schedule: using either cosine or linear schedule, for training RandAR with the hope that they could improve the performance. Their performance is slightly different from the paper's numbers, and we will release the checkpoints following the paper's numbers soon. All the checkpoints are available on [HuggingFace](https://huggingface.co/ziqipang/RandAR).
+
+We would like to highlight two observations:
+
+- Using MaskGIT's tokenizer improves the FID, because of its smaller vocabulary.
+- Using cosine or linear learning rate does not show significant performance difference at 0.7B model size.
+
+| Model | Param | Tokenizer | LR Schedule | Optimal CFG | FID | IS | Precision | Recall | Training Finished |
+| :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| RandAR-L (Paper) | 0.3B | LLaMAGen | Linear | - | 2.55 | 288 | 0.82 | 0.58 | N |
+| [RandAR-L](https://huggingface.co/ziqipang/RandAR/blob/main/randar_0.3b_llamagen_360k_bs_1024_lr_0.0004.safetensors) | 0.3B | LLaMAGen | Cosine | 3.4 | 2.65 | 249 | 0.82 | 0.56 | Y |
+| [RandAR-L](https://huggingface.co/ziqipang/RandAR/blob/main/randar_0.3b_maskgit_360k_bs_1024_lr_0.0004.safetensors) | 0.3B | MaskGIT | Cosine | 4.0 | 2.47 | 271 | 0.84 | 0.54 | Y |
+| RandAR-XL (Paper) | 0.7B | LLaMAGen | Linear | - | 2.25 | 318 | 0.80 | 0.60 | N |
+| [RandAR-XL](https://huggingface.co/ziqipang/RandAR/blob/main/randar_0.7b_llamagen_360k_bs_1024_lr_0.0004.safetensors) | 0.7B | LLaMAGen | Cosine | 4.0 | 2.27 | 275 | 0.81 | 0.59 | Y |
+| RandAR-XL | 0.7B | MaskGIT | Cosine | - | - | - | - | - | N |
+
 
 ## Citation
 
