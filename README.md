@@ -31,7 +31,7 @@ Ever thinking about what is the prerequisite for a visual model achieving the im
 
 ## Getting Started
 
-Checkout our documentation [DOCUMENTATION.md](documantation.md) for more details.
+Checkout our documentation [DOCUMENTATION.md](documentation.md) for more details.
 
 ## Pre-trained Models
 

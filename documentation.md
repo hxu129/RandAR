@@ -158,4 +158,21 @@ torchrun tools/search_cfg_weights.py \
 
 ## 6. Diverse Zero-shot Applications
 
-I will finish these parts after the checkpoints are finished.
+### Resolution Extrapolation
+
+I know that this is one of the most interesting applications shown in RandAR. To try it out, just use the following command to generate $512\times 512$ images.
+
+```bash
+torchrun tools/search_cfg_weights.py \
+    --config configs/randar/randar_xl_0.7b.yaml \
+    --exp-name randar_0.7b_360k_llamagen_resolution_extrapolation \
+    --gpt-ckpt /tmp/randar_0.7b_llamagen_360k.safetensors \
+    --vq-ckpt /tmp/vq_ds16_c2i.pt \
+    --per-proc-batch-size 8 \
+    --cfg-scales 3.0,3.0 \
+    --spatial-cfg-scales 2.5,2.5 \
+    --num-inference-steps 1024 \
+    --debug
+  ```
+
+  Since I am re-training the model, I found the behaviors of the existing checkpoints are not as stable as the ones used in the paper, probably due to a different learning rate schedule and break points during the training. I am trying to train a model following the original paper's settings. But I hope the current implementations can give everyone a good sense about our algorithms.
