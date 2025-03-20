@@ -51,6 +51,13 @@ We would like to highlight two observations:
 | [RandAR-XL](https://huggingface.co/ziqipang/RandAR/blob/main/randar_0.7b_llamagen_360k_bs_1024_lr_0.0004.safetensors) | 0.7B | LLaMAGen | Cosine | 4.0 | 2.27 | 275 | 0.81 | 0.59 | Y |
 | RandAR-XL | 0.7B | MaskGIT | Cosine | - | - | - | - | - | N |
 
+## Follow-up Works
+
+After the release of RandAR, we are thrilled to see the impressive works highly related to or extending RandAR. Please let me know if you wish more people could see your work.
+
+- [Autoregressive Image Generation with Randomized Parallel Decoding](https://github.com/hp-l33/ARPG). Haopeng Li, Jinyue Yang, Guoqi Li, Huan Wang.
+
+- [Parallelized Autoregressive Visual Generation](https://github.com/YuqingWang1029/PAR). Yuqing Wang, Shuhuai Ren, Zhijie Lin, Yujin Han, Haoyuan Guo, Zhenheng Yang, Difan Zou, Jiashi Feng, Xihui Liu. CVPR 2025
 
 ## Citation
 
