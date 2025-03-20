@@ -51,7 +51,7 @@ We would like to highlight two observations:
 | [RandAR-XL](https://huggingface.co/ziqipang/RandAR/blob/main/randar_0.7b_llamagen_360k_bs_1024_lr_0.0004.safetensors) | 0.7B | LLaMAGen | Cosine | 4.0 | 2.27 | 275 | 0.81 | 0.59 | Y |
 | RandAR-XL | 0.7B | MaskGIT | Cosine | - | - | - | - | - | N |
 
-## Follow-up Works
+## Related and Follow-up Works
 
 After the release of RandAR, we are thrilled to see the impressive works highly related to or extending RandAR. Please let me know if you wish more people could see your work.
 
