@@ -568,7 +568,7 @@ class RandARTransformer(nn.Module):
         input_pos = torch.arange(0, x.shape[1], device=cond.device)
 
         # Step 5-2: Start the loop
-        while query_token_idx_cur_step < self.block_size - num_query_token_cur_step and query_token_idx_cur_step < self.block_size - 1:
+        while query_token_idx_cur_step <= self.block_size - num_query_token_cur_step and query_token_idx_cur_step <= self.block_size - 1:
             # Step 5-3: Decode the current step tokens
             logits = self.forward_inference(x, cur_freqs_cis, input_pos)
 
