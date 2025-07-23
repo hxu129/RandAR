@@ -1,7 +1,14 @@
+PROJECT_DIR=/home/xh/projects/img-corrector/RandAR
+DATA_PATH=/mnt/solo/image-corrector
+MODEL_NAME=randar_0.3b_llamagen_360k
+
 accelerate launch --mixed_precision=bf16 --multi_gpu \
-    train_c2i.py --exp-name randar_0.7b_llamagen_360k \
-    --config configs/randar/randar_xl_0.7b_llamagen.yaml \
-    --data-path /tmp/imagenet-llamagen-adm-256_codes \
-    --vq-ckpt /tmp/vq_ds16_c2i.pt \
-    --results-dir /tmp \
-    --disk-location /SLOW_DISK/training_ckpts 
+    --num_processes 4 \
+    --num_machines 1 \
+    --dynamo_backend=inductor \
+    train_c2i.py \
+    --exp-name $MODEL_NAME-test-pipeline \
+    --config $PROJECT_DIR/configs/randar/randar_l_0.3b_llamagen.yaml \
+    --data-path $PROJECT_DIR/latents/imagenet-llamagen-adm-256_codes \
+    --vq-ckpt $PROJECT_DIR/tokenizer/llamagen/vq_ds16_c2i.pt \
+    --results-dir $DATA_PATH/results 
