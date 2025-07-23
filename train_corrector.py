@@ -39,13 +39,14 @@ from RandAR.dataset.builder import build_dataset
 from RandAR.utils.logger import create_logger
 from RandAR.utils.lr_scheduler import get_scheduler
 from RandAR.model.utils import interleave_tokens
+from RandAR.model.randar_gpt import RandARTransformer
 
 import debugpy
 
-debugpy.listen(65432)
-print("Waiting for debugger to attach...")
-debugpy.wait_for_client()
-print("Debugger attached")
+# debugpy.listen(65432)
+# print("Waiting for debugger to attach...")
+# debugpy.wait_for_client()
+# print("Debugger attached")
 
 def cycle(dl: torch.utils.data.DataLoader):
     while True:
@@ -85,6 +86,76 @@ def perturb_image_tokens(image_tokens, perturb_ratio, vocab_size):
             collision_mask = (perturbed_image_tokens == image_tokens) & perturbed_indices
             
     return perturbed_image_tokens, perturbed_indices # [bsz, seq_len], [bsz, seq_len]
+
+def get_last_n_hidden_states(
+    model: RandARTransformer,
+    image_tokens: torch.Tensor,
+    cond_tokens: torch.Tensor,
+    token_order: torch.Tensor,
+    output_last_n: int,
+    device: torch.device,
+):
+    """
+    Feeds a sequence through the RandAR model and returns the hidden states
+    from the last n layers.
+
+    Args:
+        model: The RandARTransformer model.
+        image_tokens: Tensor of shape [bs, seq_len] with **already permuted** image token IDs.
+        cond_tokens: Tensor of shape [bs] or [bs, 1] with class token IDs.
+        token_order: The permutation order used for the image_tokens.
+        output_last_n: The number of final layers to return hidden states from.
+        device: The torch device to run on.
+
+    Returns:
+        A tuple of (logits, hidden_states).
+        - logits: Tensor of shape [bs, seq_len_out, vocab_size]
+        - hidden_states: Tensor of shape [bs, seq_len_out, output_last_n * dim]
+    """
+    with torch.no_grad():
+        model.eval()  # Ensure the model is in evaluation mode
+
+        bs, seq_len = image_tokens.shape
+        assert seq_len == model.block_size, f"Input sequence length ({seq_len}) must match the model's block_size ({model.block_size})."
+
+        cond_embeddings = model.cls_embedding(cond_tokens, train=False)[:, :model.cls_token_num]
+        token_embeddings = model.tok_embeddings(image_tokens)
+        pos_instruct_tokens = model.get_position_instruction_tokens(token_order)
+
+        h = torch.cat(
+            (cond_embeddings, interleave_tokens(pos_instruct_tokens, token_embeddings)),
+            dim=1
+        )
+
+        # Correctly prepare RoPE embeddings for the sequence
+        model.freqs_cis = model.freqs_cis.to(device)
+        # 1. Select freqs for image tokens (excluding class tokens)
+        # 2. Permute them according to the token_order
+        token_freqs_cis_ordered = model.freqs_cis[model.cls_token_num:].clone()[token_order]
+        # 3. Build the full freqs_cis sequence for interleaved input
+        freqs_cis = torch.cat(
+            (model.freqs_cis[:model.cls_token_num].unsqueeze(0).repeat(bs, 1, 1, 1),
+             interleave_tokens(token_freqs_cis_ordered, token_freqs_cis_ordered)),
+            dim=1
+        )
+
+        h_for_inference = h
+        hidden_states = []
+        for layer_idx, layer in enumerate(model.layers):
+            # The layer forward in TransformerBlock doesn't use `start_pos` when KV cache is off
+            # We will call it without kv_cache.
+            h_for_inference = layer(h_for_inference, freqs_cis, start_pos=None, mask=None)
+            if output_last_n > 0 and layer_idx >= model.n_layer - output_last_n:
+                hidden_states.append(h_for_inference)
+        
+        h_final = model.norm(h_for_inference)
+        logits = model.output(h_final).float()
+
+        if output_last_n > 0:
+            return logits, torch.cat(hidden_states, dim=-1)
+        else:
+            return logits, None
+
 
 def compute_loss(logits, perturbed_indices):
     # Logits from corrector have shape [bs, 1 + 2 * block_size, 1]
@@ -158,15 +229,9 @@ def main(args):
     gpt_weight = load_safetensors(args.gpt_ckpt)
     gpt.load_state_dict(gpt_weight, strict=True)
     gpt.eval()
+    # It is crucial to freeze the pre-trained model to save memory and compute
     for param in gpt.parameters():
         param.requires_grad = False
-    del gpt_weight
-
-    # --- Extract necessary modules from the frozen GPT ---
-    tok_embeddings = gpt.tok_embeddings
-    cls_embedding = gpt.cls_embedding
-    get_position_instruction_tokens = gpt.get_position_instruction_tokens
-    freqs_cis = gpt.freqs_cis.to(accelerator.device)
 
     # --- Create Corrector Model ---
     corrector = instantiate_from_config(config.corrector_model).to(accelerator.device)
@@ -244,25 +309,18 @@ def main(args):
                 config.corrector_model.params.vocab_size
             )
 
-            # 2. Prepare embeddings using the frozen gpt model
-            cond_embeddings = cls_embedding(cond, train=False)[:, :cls_token_num]
-            token_embeddings = tok_embeddings(perturbed_tokens)
-            pos_instruct_tokens = get_position_instruction_tokens(token_order)
-            
-            h = torch.cat(
-                (cond_embeddings, interleave_tokens(pos_instruct_tokens, token_embeddings)),
-                dim=1
-            )
-            
-            # 3. Prepare RoPE embeddings
-            token_freqs_cis = freqs_cis[cls_token_num:].clone()[token_order]
-            token_freqs_cis = torch.cat(
-                (freqs_cis[:cls_token_num].unsqueeze(0).repeat(bs, 1, 1, 1), interleave_tokens(token_freqs_cis, token_freqs_cis)),
-                dim=1
+            # 2. Get hidden states from the frozen gpt model
+            logits, hidden_states = get_last_n_hidden_states(
+                gpt,
+                perturbed_tokens,
+                cond,
+                token_order,
+                output_last_n=config.corrector_model.params.num_ar_layers_for_input,
+                device=accelerator.device
             )
 
-            # 4. Forward pass through corrector
-            logits = corrector(h, token_freqs_cis)
+            # 3. Forward pass through corrector
+            logits = corrector(hidden_states)
             loss = compute_loss(logits, perturbed_indices)
             
             # 5. Backward pass
