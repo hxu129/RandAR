@@ -192,7 +192,15 @@ def main(args):
         
     ################## Resume Training ##################
     train_steps = 0
-    # TODO: Implement resume from checkpoint logic
+    if os.path.exists(checkpoint_dir) and len(os.listdir(checkpoint_dir)) > 0:
+        saved_ckpt_dirs = [_ for _ in os.listdir(checkpoint_dir) if _.startswith("iters")]
+        if len(saved_ckpt_dirs) > 0:
+            saved_ckpt_dirs = sorted(saved_ckpt_dirs, key=lambda x: int(x.split('_')[-1]))
+            ckpt_dir = os.path.join(checkpoint_dir, saved_ckpt_dirs[-1])
+            if accelerator.is_main_process:
+                logger.info(f"Resuming from checkpoint: {ckpt_dir}")
+            accelerator.load_state(ckpt_dir)
+            train_steps = int(saved_ckpt_dirs[-1].split("_")[-1])
 
     #################### Training Loop ####################
     corrector.train()
@@ -269,10 +277,24 @@ def main(args):
 
             if train_steps % args.ckpt_every == 0 and accelerator.is_main_process:
                 ckpt_path = os.path.join(checkpoint_dir, f"iters_{train_steps:08d}")
-                os.makedirs(ckpt_path, exist_ok=True)
-                # TODO: Save state with accelerator
-                # accelerator.save_state(ckpt_path)
+                accelerator.save_state(ckpt_path)
                 logger.info(f"Saved Iter {train_steps} checkpoint to {ckpt_path}")
+
+                # Clean up old checkpoints
+                saved_ckpt_dirs = sorted(
+                    [d for d in os.listdir(checkpoint_dir) if d.startswith("iters")],
+                    key=lambda x: int(x.split('_')[-1])
+                )
+                if len(saved_ckpt_dirs) > args.keep_last_k:
+                    for old_ckpt_dir in saved_ckpt_dirs[:-args.keep_last_k]:
+                        shutil.rmtree(os.path.join(checkpoint_dir, old_ckpt_dir))
+                        logger.info(f"Removed old checkpoint: {old_ckpt_dir}")
+
+    # Save the final checkpoint
+    if accelerator.is_main_process:
+        final_ckpt_dir = os.path.join(checkpoint_dir, f"iters_{train_steps:08d}_final")
+        accelerator.save_state(final_ckpt_dir)
+        logger.info(f"Saved Final Iter {train_steps} checkpoint to {final_ckpt_dir}")
 
     logger.info("Training Done.")
     accelerator.end_training()
