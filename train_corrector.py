@@ -166,11 +166,14 @@ def compute_loss(logits, perturbed_indices):
     
     # Squeeze the last dimension to match the target shape
     image_token_logits = image_token_logits.squeeze(-1) # Shape: [bs, block_size]
+
+    # compute accuracy
+    acc = ((image_token_logits.sigmoid() > 0.5) == perturbed_indices).float().mean()
     
     # Target (perturbed_indices) also has shape [bs, block_size]
     # It needs to be converted to float for the loss function
     return F.binary_cross_entropy_with_logits(image_token_logits,
-                                              perturbed_indices.float())
+                                              perturbed_indices.float()), acc
 
 def main(args):
     assert torch.cuda.is_available(), "Training currently requires at least one GPU."
@@ -321,7 +324,7 @@ def main(args):
 
             # 3. Forward pass through corrector
             logits = corrector(hidden_states)
-            loss = compute_loss(logits, perturbed_indices)
+            loss, acc = compute_loss(logits, perturbed_indices)
             
             # 5. Backward pass
             accelerator.backward(loss)
@@ -342,8 +345,8 @@ def main(args):
                 end_time = time.time()
                 average_time = (end_time - start_time) / args.log_every
 
-                logger.info(f"Step {train_steps:08d} | Loss {average_loss:.4f} | Time {average_time:.4f}s | LR {lr_scheduler.get_last_lr()[0]:.6f}")
-                accelerator.log({"loss": average_loss, "lr": lr_scheduler.get_last_lr()[0], "time": average_time}, step=train_steps)
+                logger.info(f"Step {train_steps:08d} | Loss {average_loss:.4f} | Acc {acc:.4f} | Time {average_time:.4f}s | LR {lr_scheduler.get_last_lr()[0]:.6f}")
+                accelerator.log({"loss": average_loss, "acc": acc, "lr": lr_scheduler.get_last_lr()[0], "time": average_time}, step=train_steps)
                 
                 running_loss, start_time = 0, time.time()
 
