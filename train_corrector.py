@@ -1,36 +1,55 @@
+# This script trains a Corrector model, which is a transformer-based model that
+# learns to predict which tokens in a sequence are "incorrect" or "perturbed".
+#
+# It leverages a pre-trained RandAR model to generate rich embeddings for the input sequence.
+# The core idea is to:
+# 1. Take a sequence of image tokens.
+# 2. Randomly perturb a certain ratio of these tokens.
+# 3. Feed the perturbed sequence through the frozen RandAR model to get embeddings.
+# 4. Train the Corrector model to take these embeddings and output a probability for each token's position,
+#    indicating whether it was one of the perturbed tokens.
+#
+# This script is heavily inspired by the structure of train_c2i.py and uses accelerate for
+# distributed training and experiment management.
+
 import torch
-from RandAR.corrector.corrector import LinearCorrector, MLPCorrector, TransformerCorrector
-from RandAR.dataset.builder import build_dataset
-from torch.utils.data import DataLoader
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+
 import torch.distributed as dist
 import torch.nn.functional as F
 import torchvision.transforms as transforms
-from RandAR.corrector.utils import interleave_tokens
-from RandAR.util import instantiate_from_config, load_safetensors
-from argparse import ArgumentParser
+from torch.utils.data import DataLoader
+
+import os
+import time
+import argparse
+import sys
+sys.path.append("./")
+import shutil
+
 from omegaconf import OmegaConf
+from accelerate import Accelerator, DistributedDataParallelKwargs
+from accelerate.utils import set_seed, ProjectConfiguration
+from accelerate.logging import get_logger
 
+from RandAR.util import instantiate_from_config, load_safetensors
+from RandAR.dataset.builder import build_dataset
+from RandAR.utils.logger import create_logger
+from RandAR.utils.lr_scheduler import get_scheduler
+from RandAR.corrector.utils import interleave_tokens
 
-# Note: the hard coded parameters need to be replaced with hyper-param
-# later when the logic is ok
-# The params below are from the RandAR corrector's config
-cls_token_num = 1
-block_size = 256
-dim = 1024
-n_head = 16
-rope_base = 10000
-vocab_size = 16384
+def cycle(dl: torch.utils.data.DataLoader):
+    while True:
+        for data in dl:
+            yield data
 
-# unique params for corrector
-max_iters = 10000
-num_workers = 8
-per_gpu_batch_size = 16
-
-def perturb_image_tokens(image_tokens, perturb_ratio=0.1):
+def perturb_image_tokens(image_tokens, perturb_ratio, vocab_size):
     '''
     Args:
         image_tokens: [bsz, seq_len]
         perturb_ratio: float, the ratio of perturbed tokens
+        vocab_size: int, the size of the vocabulary to sample replacements from
     '''
     bs, seq_len = image_tokens.shape
     device = image_tokens.device
@@ -60,8 +79,8 @@ def perturb_image_tokens(image_tokens, perturb_ratio=0.1):
     return perturbed_image_tokens, perturbed_indices # [bsz, seq_len], [bsz, seq_len]
 
 def compute_loss(logits, perturbed_indices):
-    # logits from corrector have shape [bs, 1 + 2 * block_size, 1]
-    # we need to select the logits for the image token positions
+    # Logits from corrector have shape [bs, 1 + 2 * block_size, 1]
+    # We need to select the logits for the image token positions.
     image_token_logits = logits[:, 1::2, :] # Shape: [bs, block_size, 1]
     
     # Squeeze the last dimension to match the target shape
@@ -73,125 +92,212 @@ def compute_loss(logits, perturbed_indices):
                                               perturbed_indices.float())
 
 def main(args):
-    # prepare data
+    assert torch.cuda.is_available(), "Training currently requires at least one GPU."
+    
+    config = OmegaConf.load(args.config)
+    ar_config = OmegaConf.load(config.ar_model_config_path)
+
+    #################### Accelerator ####################
+    args.exp_name = args.exp_name + f'_bs_{config.training_params.global_batch_size}_lr_{config.optimizer.lr}'
+    experiment_dir = os.path.join(args.results_dir, args.exp_name)
+    
+    accelerator_config = ProjectConfiguration(project_dir=experiment_dir)
+    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+    accelerator = Accelerator(
+        project_config=accelerator_config,
+        kwargs_handlers=[ddp_kwargs],
+        mixed_precision=config.accelerator.mixed_precision,
+        log_with=config.accelerator.log_with,
+        gradient_accumulation_steps=config.accelerator.gradient_accumulation_steps,
+    )
+    set_seed(config.global_seed + accelerator.process_index)
+
+    checkpoint_dir = os.path.join(experiment_dir, "checkpoints")
+    if accelerator.is_main_process:
+        os.makedirs(experiment_dir, exist_ok=True)
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        logger = create_logger(experiment_dir)
+        logger.info(f"Experiment directory: {experiment_dir}")
+        logger.info(f"Corrector Config: {config}")
+        logger.info(f"Loaded AR Config: {ar_config}")
+    else:
+        logger = create_logger(None)
+
+    #################### Data, Model, Optimization ####################
     dataset = build_dataset(is_train=True, args=args, transform=transforms.ToTensor())
+    per_gpu_batch_size = int(
+        config.training_params.global_batch_size
+        // accelerator.num_processes
+        // config.accelerator.gradient_accumulation_steps
+    )
     data_loader = DataLoader(
         dataset,
         batch_size=per_gpu_batch_size,
         shuffle=True,
-        num_workers=num_workers,
+        num_workers=args.num_workers,
         pin_memory=True,
         drop_last=True,
         persistent_workers=True,
         prefetch_factor=8,
     )
+    logger.info("Datasets contains {} samples".format(len(dataset)))
 
-    # prepare RandAR corrector instance
-    gpt = instantiate_from_config(config.ar_model).to(device=device, dtype=precision)
-    corrector_weight = load_safetensors(args.gpt_ckpt)
-    gpt.load_state_dict(corrector_weight, strict=True)
+    # --- Load Pre-trained RandAR Model (and freeze it) ---
+    logger.info(f"Loading pre-trained RandAR model from: {args.gpt_ckpt}")
+    gpt = instantiate_from_config(ar_config.ar_model).to(accelerator.device)
+    gpt_weight = load_safetensors(args.gpt_ckpt)
+    gpt.load_state_dict(gpt_weight, strict=True)
     gpt.eval()
+    for param in gpt.parameters():
+        param.requires_grad = False
+    del gpt_weight
 
-    # read pretrained modules from RandAR corrector
+    # --- Extract necessary modules from the frozen GPT ---
     tok_embeddings = gpt.tok_embeddings
     cls_embedding = gpt.cls_embedding
     get_position_instruction_tokens = gpt.get_position_instruction_tokens
     freqs_cis = gpt.freqs_cis
 
-    # freeze imported modules
-    for p in tok_embeddings.parameters():
-        p.requires_grad = False
-    for p in cls_embedding.parameters():
-        p.requires_grad = False
-    gpt.pos_instruct_embeddings.requires_grad = False
+    # --- Create Corrector Model ---
+    corrector = instantiate_from_config(config.corrector_model).to(accelerator.device)
+    logger.info(f"Corrector Parameters: {sum(p.numel() for p in corrector.parameters()):,}")
 
-    # prepare corrector instance, optimizer, scheduler 
-    corrector = TransformerCorrector()
+    # --- Optimizer and Scheduler ---
+    optimizer = torch.optim.AdamW(corrector.parameters(), lr=config.optimizer.lr, weight_decay=config.optimizer.weight_decay, betas=config.optimizer.betas)
+    lr_scheduler = get_scheduler(
+        name=config.lr_scheduler.type,
+        optimizer=optimizer,
+        num_warmup_steps=config.lr_scheduler.warm_up_iters * config.accelerator.gradient_accumulation_steps,
+        num_training_steps=config.training_params.max_iters * config.accelerator.gradient_accumulation_steps,
+    )
+    
+    corrector, optimizer, data_loader, lr_scheduler = accelerator.prepare(
+        corrector, optimizer, data_loader, lr_scheduler
+    )
+    data_loader = cycle(data_loader)
+    
+    #################### Wandb Setup ####################
+    if accelerator.is_main_process:
+        accelerator.init_trackers(
+            project_name=args.wandb_project,
+            init_kwargs={
+                "wandb": {
+                    "entity": args.wandb_entity,
+                    "config": OmegaConf.to_container(config, resolve=True),
+                    "name": args.exp_name,
+                    "dir": experiment_dir,
+                }
+            },
+        )
+        
+    ################## Resume Training ##################
+    train_steps = 0
+    # TODO: Implement resume from checkpoint logic
 
-    optimizer = torch.optim.AdamW(corrector.parameters(), lr=1e-4)
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=10000, gamma=0.1)
-
-    # start training
+    #################### Training Loop ####################
     corrector.train()
-    for i in range(max_iters):
-        x, y, inat_index = next(data_loader)
+    total_iters = config.training_params.max_iters
+    log_iters, running_loss, start_time = 0, 0, time.time()
+    block_size = config.corrector_model.params.block_size
+    cls_token_num = config.corrector_model.params.cls_token_num
+
+    logger.info(f"Starting training from iteration {train_steps} to {total_iters}")
+    while train_steps < total_iters:
+        x, y, _ = next(data_loader)
         image_tokens = x.reshape(x.shape[0], -1)
         cond = y.reshape(-1)
-
-        # 1. prepare token sequence in the format of [cls_token, query_token_0, ..., query_token_n]
-        # 1.1. prepare the token order
         bs = image_tokens.shape[0]
-        token_order = torch.arange(block_size, device=image_tokens.device)
-        token_order = token_order.unsqueeze(0).repeat(bs, 1)
-        for i in range(bs):
-            token_order[i] = token_order[i][torch.randperm(block_size)]
-        token_order = token_order.contiguous()
 
-        # 1.2. permute the image tokens according to the random order
-        image_tokens = torch.gather(image_tokens.unsqueeze(-1), 1, token_order.unsqueeze(-1)).squeeze(-1).contiguous()
+        with accelerator.accumulate(corrector):
+            # 1. Prepare token sequence
+            token_order = torch.arange(block_size, device=accelerator.device).unsqueeze(0).repeat(bs, 1)
+            for i in range(bs):
+                token_order[i] = token_order[i][torch.randperm(block_size)]
+            
+            permuted_image_tokens = torch.gather(image_tokens, 1, token_order)
 
-        # 1.3. perturb the image tokens
-        perturbed_image_tokens, perturbed_indices = perturb_image_tokens(image_tokens)
+            perturbed_tokens, perturbed_indices = perturb_image_tokens(
+                permuted_image_tokens,
+                config.training_params.perturb_ratio,
+                config.corrector_model.params.vocab_size
+            )
 
-        # 1.4. prepare embeddings and freqs_cis
-        freqs_cis = freqs_cis.to(cond.device)
-        cond_embeddings = cls_embedding(cond, train=corrector.training)[
-            :, : corrector.cls_token_num
-        ] # [bsz, cls_token_num, dim]
+            # 2. Prepare embeddings using the frozen gpt model
+            cond_embeddings = cls_embedding(cond, train=False)[:, :cls_token_num]
+            token_embeddings = tok_embeddings(perturbed_tokens)
+            pos_instruct_tokens = get_position_instruction_tokens(token_order)
+            
+            h = torch.cat(
+                (cond_embeddings, interleave_tokens(pos_instruct_tokens, token_embeddings)),
+                dim=1
+            )
+            
+            # 3. Prepare RoPE embeddings
+            token_freqs_cis = freqs_cis[cls_token_num:].clone()[token_order]
+            token_freqs_cis = torch.cat(
+                (freqs_cis[:cls_token_num].unsqueeze(0).repeat(bs, 1, 1, 1), interleave_tokens(token_freqs_cis, token_freqs_cis)),
+                dim=1
+            )
 
-        token_embeddings = tok_embeddings(perturbed_image_tokens)
-        position_instruction_tokens = get_position_instruction_tokens(token_order) # [bsz, seq_len, dim]
-        h = torch.cat(
-            (cond_embeddings, interleave_tokens(position_instruction_tokens, token_embeddings)),
-            dim=1
-        )
+            # 4. Forward pass through corrector
+            logits = corrector(h, token_freqs_cis)
+            loss = compute_loss(logits, perturbed_indices, block_size)
+            
+            # 5. Backward pass
+            accelerator.backward(loss)
+            if config.optimizer.max_grad_norm > 0:
+                accelerator.clip_grad_norm_(corrector.parameters(), config.optimizer.max_grad_norm)
+            
+            optimizer.step()
+            lr_scheduler.step()
+            optimizer.zero_grad()
 
-        # 1.5 prepare 2d rope embd for the corrector
-        token_freqs_cis = freqs_cis[cls_token_num:].clone().to(token_order.device)[token_order]
-        token_freqs_cis = torch.cat(
-            (freqs_cis[:cls_token_num].unsqueeze(0).repeat(bs, 1, 1, 1), interleave_tokens(token_freqs_cis, token_freqs_cis)),
-            dim=1
-        )
+            running_loss += accelerator.gather(loss.repeat(per_gpu_batch_size)).mean().item() / config.accelerator.gradient_accumulation_steps
 
-        # 2. forward
-        logits = corrector(h, token_freqs_cis)
+        if accelerator.sync_gradients:
+            train_steps += 1
+            
+            if train_steps % args.log_every == 0 and accelerator.is_main_process:
+                average_loss = running_loss / args.log_every
+                end_time = time.time()
+                average_time = (end_time - start_time) / args.log_every
 
-        # 3. compute loss
-        loss = compute_loss(logits, perturbed_indices)
+                logger.info(f"Step {train_steps:08d} | Loss {average_loss:.4f} | Time {average_time:.4f}s | LR {lr_scheduler.get_last_lr()[0]:.6f}")
+                accelerator.log({"loss": average_loss, "lr": lr_scheduler.get_last_lr()[0], "time": average_time}, step=train_steps)
+                
+                running_loss, start_time = 0, time.time()
 
-        # 4. backward
-        loss.backward()
-        optimizer.step()
-        optimizer.zero_grad()
-        scheduler.step()
+            if train_steps % args.ckpt_every == 0 and accelerator.is_main_process:
+                ckpt_path = os.path.join(checkpoint_dir, f"iters_{train_steps:08d}")
+                os.makedirs(ckpt_path, exist_ok=True)
+                # TODO: Save state with accelerator
+                # accelerator.save_state(ckpt_path)
+                logger.info(f"Saved Iter {train_steps} checkpoint to {ckpt_path}")
+
+    logger.info("Training Done.")
+    accelerator.end_training()
 
 
 if __name__ == "__main__":
-    parser = ArgumentParser()
-    parser.add_argument("--config", type=str, default="configs/randar/randar_l_0.3b_llamagen.yaml")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", type=str, default="configs/corrector/corrector_base.yaml")
     parser.add_argument("--exp-name", type=str, required=True)
-    parser.add_argument("--gpt-ckpt", type=str, default=None, help="ckpt path for resume training")
-    parser.add_argument("--ema", action="store_true", help="whether using ema training")
-    parser.add_argument("--no-compile", action="store_true")
-    parser.add_argument("--results-dir", type=str, default="results")
-    parser.add_argument("--image-size", type=int, choices=[128, 256, 384, 448, 512], default=256)
-    parser.add_argument("--downsample-size", type=int, choices=[8, 16], default=16)
-    parser.add_argument("--num-classes", type=int, default=1000)
-    # with 512 bs. 2.5k iters is 1 epoch
-    parser.add_argument("--max-iters", type=int, default=100000)
-    parser.add_argument("--global-seed", type=int, default=0)
-    parser.add_argument("--num-workers", type=int, default=16)
-    parser.add_argument("--log-every", type=int, default=20)
-    parser.add_argument("--ckpt-every", type=int, default=5000)  # save every 5k iters
-    # keep last k checkpoints; 1 means only keep the last checkpoint
-    parser.add_argument("--keep-last-k", type=int, default=1)
-    parser.add_argument("--mixed-precision", type=str, default="bf16", choices=["none", "fp16", "bf16"])
-    # data
-    parser.add_argument("--dataset", type=str, default="latent")
+    parser.add_argument("--results-dir", type=str, default="results_corrector")
+    parser.add_argument("--gpt-ckpt", type=str, required=True, help="Path to the pre-trained RandAR model checkpoint (.safetensors)")
+    
+    # Data related
     parser.add_argument("--data-path", type=str, required=True)
-    parser.add_argument("--visualize-every", type=int, default=2000)
-    parser.add_argument("--visualize-num", type=int, default=32)
-    # wandb
+    parser.add_argument("--dataset", type=str, default="latent", help="Dataset type, matches builder.")
+    parser.add_argument("--image-size", type=int, default=256)
+    parser.add_argument("--num-classes", type=int, default=1000)
+    parser.add_argument("--num-workers", type=int, default=8)
+
+    # Logging and Checkpointing
+    parser.add_argument("--log-every", type=int, default=100)
+    parser.add_argument("--ckpt-every", type=int, default=10000)
+    parser.add_argument("--keep-last-k", type=int, default=3)
+
+    # W&B
     parser.add_argument("--wandb-entity", type=str, default="hxu129-hkust")
     parser.add_argument("--wandb-project", type=str, default="image-corrector-cvpr-26")
     parser.add_argument("--wandb-offline", action="store_true")
