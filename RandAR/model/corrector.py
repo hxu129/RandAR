@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from typing import Optional, List
 
 class LinearCorrector(nn.Module):
     def __init__(self, 
@@ -21,8 +22,22 @@ class LinearCorrector(nn.Module):
         return self.linear(x)
 
 class MLPCorrector(nn.Module):
-    def __init__():
+    def __init__(self,
+                 dim: int = 1024,
+                 hidden_dim: Optional[List[int]] = None):
         super().__init__()
+        if hidden_dim is None:
+            self.mlp = nn.Linear(dim, 1)
+        else:
+            self.mlp = nn.Sequential(
+                nn.Linear(dim, hidden_dim[0]),
+                nn.GELU(),
+                *[nn.Sequential(
+                    nn.Linear(hidden_dim[i], hidden_dim[i + 1]),
+                    nn.GELU(),
+                ) for i in range(len(hidden_dim) - 1)],
+                nn.Linear(hidden_dim[-1], 1)
+            )
 
     def forward(self, x: torch.Tensor, *args, **kwargs) -> torch.Tensor:
         """Args:
@@ -34,8 +49,7 @@ class MLPCorrector(nn.Module):
         Returns:
             torch.Tensor: The output logits of shape `[batch_size, seq_len, 1]`.
         """
-        # TODO: Implement the forward pass logic
-        pass
+        return self.mlp(x)
 
 class TransformerCorrector(nn.Module):
 
