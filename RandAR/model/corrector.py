@@ -5,9 +5,11 @@ from typing import Optional, List
 
 class LinearCorrector(nn.Module):
     def __init__(self, 
-                 dim: int = 1024):
+                 dim: int = 1024,
+                 num_ar_layers_for_input: int = 12,
+                 *args, **kwargs):
         super().__init__()
-        self.linear = nn.Linear(dim, 1)
+        self.linear = nn.Linear(dim * num_ar_layers_for_input, 1)
     
     def forward(self, x: torch.Tensor, *args, **kwargs) -> torch.Tensor:
         """Args:
@@ -24,13 +26,15 @@ class LinearCorrector(nn.Module):
 class MLPCorrector(nn.Module):
     def __init__(self,
                  dim: int = 1024,
-                 hidden_dim: Optional[List[int]] = None):
+                 hidden_dim: Optional[List[int]] = None,
+                 num_ar_layers_for_input: int = 12,
+                 *args, **kwargs):
         super().__init__()
         if hidden_dim is None:
-            self.mlp = nn.Linear(dim, 1)
+            self.mlp = nn.Linear(dim * num_ar_layers_for_input, 1)
         else:
             self.mlp = nn.Sequential(
-                nn.Linear(dim, hidden_dim[0]),
+                nn.Linear(dim * num_ar_layers_for_input, hidden_dim[0]),
                 nn.GELU(),
                 *[nn.Sequential(
                     nn.Linear(hidden_dim[i], hidden_dim[i + 1]),
@@ -52,6 +56,13 @@ class MLPCorrector(nn.Module):
         return self.mlp(x)
 
 class TransformerCorrector(nn.Module):
+    def __init__(self,
+                 dim: int = 1024,
+                 hidden_dim: Optional[List[int]] = None,
+                 num_ar_layers_for_input: int = 12,
+                 *args, **kwargs):
+        super().__init__()
+        pass
 
     def forward(self, x: torch.Tensor, *args, **kwargs) -> torch.Tensor:
         """Args:
