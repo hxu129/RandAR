@@ -1,18 +1,15 @@
 # This is the configuration for training the Corrector model.
 
-# Path to the configuration file of the pre-trained RandAR model.
-# This is used to load the architecture of the frozen GPT model correctly.
-ar_model_config_path: "configs/randar/randar_xl_0.7b.yaml"
-
 # Global seed for reproducibility
 global_seed: 0
 
 # Corrector Model parameters
 # We define the model we are actually training here.
 corrector_model:
-  target: RandAR.corrector.corrector.TransformerCorrector
+  target: RandAR.model.corrector.MLPCorrector
   params:
     dim: 1024
+    hidden_dim: [4096, 4096]
     n_head: 16
     n_layer: 12 # A reasonable starting point, can be tuned
     dropout: 0.1

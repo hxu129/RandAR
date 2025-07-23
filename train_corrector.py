@@ -29,6 +29,7 @@ sys.path.append("./")
 import shutil
 
 from omegaconf import OmegaConf
+from omegaconf.listconfig import ListConfig
 from accelerate import Accelerator, DistributedDataParallelKwargs
 from accelerate.utils import set_seed, ProjectConfiguration
 from accelerate.logging import get_logger
@@ -37,7 +38,14 @@ from RandAR.util import instantiate_from_config, load_safetensors
 from RandAR.dataset.builder import build_dataset
 from RandAR.utils.logger import create_logger
 from RandAR.utils.lr_scheduler import get_scheduler
-from RandAR.corrector.utils import interleave_tokens
+from RandAR.model.utils import interleave_tokens
+
+import debugpy
+
+debugpy.listen(65432)
+print("Waiting for debugger to attach...")
+debugpy.wait_for_client()
+print("Debugger attached")
 
 def cycle(dl: torch.utils.data.DataLoader):
     while True:
@@ -81,7 +89,9 @@ def perturb_image_tokens(image_tokens, perturb_ratio, vocab_size):
 def compute_loss(logits, perturbed_indices):
     # Logits from corrector have shape [bs, 1 + 2 * block_size, 1]
     # We need to select the logits for the image token positions.
-    image_token_logits = logits[:, 1::2, :] # Shape: [bs, block_size, 1]
+    # The interleaved sequence is: [cls_token, pos_instruct_0, image_token_0, pos_instruct_1, image_token_1, ...]
+    # So, we need to select the logits at indices 2, 4, 6, ...
+    image_token_logits = logits[:, 2::2, :] # Shape: [bs, block_size, 1]
     
     # Squeeze the last dimension to match the target shape
     image_token_logits = image_token_logits.squeeze(-1) # Shape: [bs, block_size]
@@ -95,7 +105,7 @@ def main(args):
     assert torch.cuda.is_available(), "Training currently requires at least one GPU."
     
     config = OmegaConf.load(args.config)
-    ar_config = OmegaConf.load(config.ar_model_config_path)
+    ar_config = OmegaConf.load(args.ar_model_config_path)
 
     #################### Accelerator ####################
     args.exp_name = args.exp_name + f'_bs_{config.training_params.global_batch_size}_lr_{config.optimizer.lr}'
@@ -156,7 +166,7 @@ def main(args):
     tok_embeddings = gpt.tok_embeddings
     cls_embedding = gpt.cls_embedding
     get_position_instruction_tokens = gpt.get_position_instruction_tokens
-    freqs_cis = gpt.freqs_cis
+    freqs_cis = gpt.freqs_cis.to(accelerator.device)
 
     # --- Create Corrector Model ---
     corrector = instantiate_from_config(config.corrector_model).to(accelerator.device)
@@ -192,13 +202,15 @@ def main(args):
         
     ################## Resume Training ##################
     train_steps = 0
-    if os.path.exists(checkpoint_dir) and len(os.listdir(checkpoint_dir)) > 0:
+    if False:
+    # if os.path.exists(checkpoint_dir) and len(os.listdir(checkpoint_dir)) > 0:
         saved_ckpt_dirs = [_ for _ in os.listdir(checkpoint_dir) if _.startswith("iters")]
         if len(saved_ckpt_dirs) > 0:
             saved_ckpt_dirs = sorted(saved_ckpt_dirs, key=lambda x: int(x.split('_')[-1]))
             ckpt_dir = os.path.join(checkpoint_dir, saved_ckpt_dirs[-1])
             if accelerator.is_main_process:
                 logger.info(f"Resuming from checkpoint: {ckpt_dir}")
+            torch.serialization.add_safe_globals([ListConfig])
             accelerator.load_state(ckpt_dir)
             train_steps = int(saved_ckpt_dirs[-1].split("_")[-1])
 
@@ -212,6 +224,8 @@ def main(args):
     logger.info(f"Starting training from iteration {train_steps} to {total_iters}")
     while train_steps < total_iters:
         x, y, _ = next(data_loader)
+        x = x.to(accelerator.device, non_blocking=True)
+        y = y.to(accelerator.device, non_blocking=True)
         image_tokens = x.reshape(x.shape[0], -1)
         cond = y.reshape(-1)
         bs = image_tokens.shape[0]
@@ -220,7 +234,7 @@ def main(args):
             # 1. Prepare token sequence
             token_order = torch.arange(block_size, device=accelerator.device).unsqueeze(0).repeat(bs, 1)
             for i in range(bs):
-                token_order[i] = token_order[i][torch.randperm(block_size)]
+                token_order[i] = token_order[i][torch.randperm(block_size, device=accelerator.device)]
             
             permuted_image_tokens = torch.gather(image_tokens, 1, token_order)
 
@@ -249,7 +263,7 @@ def main(args):
 
             # 4. Forward pass through corrector
             logits = corrector(h, token_freqs_cis)
-            loss = compute_loss(logits, perturbed_indices, block_size)
+            loss = compute_loss(logits, perturbed_indices)
             
             # 5. Backward pass
             accelerator.backward(loss)
@@ -290,6 +304,18 @@ def main(args):
                         shutil.rmtree(os.path.join(checkpoint_dir, old_ckpt_dir))
                         logger.info(f"Removed old checkpoint: {old_ckpt_dir}")
 
+                # copy the checkpoint to the disk location
+                if args.disk_location:
+                    disk_location = os.path.join(args.disk_location, args.exp_name)
+                    # using try-catch to bypass random disk error or quota issues
+                    try:
+                        if os.path.exists(disk_location):
+                            shutil.rmtree(disk_location)
+                        shutil.copytree(checkpoint_dir, disk_location)
+                        logger.info(f"Copied checkpoint to {disk_location}")
+                    except Exception as e:
+                        logger.error(f"Error copying checkpoint to {disk_location}: {e}")
+
     # Save the final checkpoint
     if accelerator.is_main_process:
         final_ckpt_dir = os.path.join(checkpoint_dir, f"iters_{train_steps:08d}_final")
@@ -299,12 +325,21 @@ def main(args):
     logger.info("Training Done.")
     accelerator.end_training()
 
+    # using shutil to copy the final checkpoint to the disk location
+    if args.disk_location:
+        disk_location = os.path.join(args.disk_location, args.exp_name)
+        if os.path.exists(disk_location):
+            shutil.rmtree(disk_location)
+        shutil.copytree(checkpoint_dir, disk_location)
+        logger.info(f"Copied final checkpoint to {disk_location}")
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, default="configs/corrector/corrector_base.yaml")
     parser.add_argument("--exp-name", type=str, required=True)
     parser.add_argument("--results-dir", type=str, default="results_corrector")
+    parser.add_argument("--ar-model-config-path", type=str, default="configs/randar/randar_xl_0.7b.yaml")
     parser.add_argument("--gpt-ckpt", type=str, required=True, help="Path to the pre-trained RandAR model checkpoint (.safetensors)")
     
     # Data related
@@ -315,8 +350,8 @@ if __name__ == "__main__":
     parser.add_argument("--num-workers", type=int, default=8)
 
     # Logging and Checkpointing
-    parser.add_argument("--log-every", type=int, default=100)
-    parser.add_argument("--ckpt-every", type=int, default=10000)
+    parser.add_argument("--log-every", type=int, default=5)
+    parser.add_argument("--ckpt-every", type=int, default=500)
     parser.add_argument("--keep-last-k", type=int, default=3)
 
     # W&B
@@ -325,4 +360,8 @@ if __name__ == "__main__":
     parser.add_argument("--wandb-offline", action="store_true")
     parser.add_argument("--disk-location", type=str, default='')
     args = parser.parse_args()
+
+    if args.wandb_offline:
+        os.environ["WANDB_MODE"] = "offline"
+
     main(args)
