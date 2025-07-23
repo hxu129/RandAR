@@ -252,7 +252,7 @@ if __name__ == "__main__":
     parser.add_argument("--num-inference-steps", type=int, default=88)
     parser.add_argument("--per-proc-batch-size", type=int, default=32)
     parser.add_argument("--num-fid-samples-search", type=int, default=10000)
-    parser.add_argument("--num-fid-samples-report", type=int, default=50000)
+    parser.add_argument("--num-fid-samples-final", type=int, default=50000)
     parser.add_argument("--global-seed", type=int, default=0)
     parser.add_argument("--top-k", type=int, default=0, help="top-k value to sample with")
     parser.add_argument("--temperature", type=float, default=1.0, help="temperature value to sample with")

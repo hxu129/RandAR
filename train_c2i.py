@@ -131,7 +131,7 @@ def main(args):
         os.environ["WANDB_MODE"] = "offline"
     if accelerator.is_main_process:
         accelerator.init_trackers(
-            project_name="RandAR-Release",
+            project_name=args.wandb_project,
             init_kwargs={
                 "wandb": {
                     "entity": args.wandb_entity,
@@ -342,7 +342,8 @@ if __name__ == "__main__":
     parser.add_argument("--visualize-every", type=int, default=2000)
     parser.add_argument("--visualize-num", type=int, default=32)
     # wandb
-    parser.add_argument("--wandb-entity", type=str, default="RandAR")
+    parser.add_argument("--wandb-entity", type=str, default="hxu129-hkust")
+    parser.add_argument("--wandb-project", type=str, default="image-corrector-cvpr-26")
     parser.add_argument("--wandb-offline", action="store_true")
     parser.add_argument("--disk-location", type=str, default='')
     args = parser.parse_args()
