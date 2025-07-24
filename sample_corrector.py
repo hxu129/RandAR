@@ -76,6 +76,11 @@ def main(args):
     gpt_model.load_state_dict(model_weight, strict=True)
     gpt_model.eval()
 
+    corrector_config = OmegaConf.load(args.corrector_config)
+    corrector_model = instantiate_from_config(corrector_config.corrector_model).to(device=device, dtype=precision)
+    corrector_model.load_state_dict(load_safetensors(args.corrector_ckpt))
+    corrector_model.eval()
+
     # Create folder to save samples:
     ckpt_string_name = (
         os.path.basename(args.gpt_ckpt)
@@ -120,7 +125,7 @@ def main(args):
         cfg_scales = args.cfg_scales.split(",")
         cfg_scales = [float(cfg_scale) for cfg_scale in cfg_scales]
 
-        indices = gpt_model.generate(
+        indices = gpt_model.generate_with_corrector(
             cond=c_indices,
             token_order=None,
             cfg_scales=cfg_scales,
@@ -128,6 +133,10 @@ def main(args):
             temperature=args.temperature,
             top_k=args.top_k,
             top_p=args.top_p,
+            corrector=corrector_model,
+            corrector_threshold=args.corrector_threshold,
+            corrector_max_steps=args.corrector_max_steps,
+            corrector_num_ar_layers=corrector_config.corrector_model.params.num_ar_layers_for_input,
         )
 
         samples = tokenizer.decode_codes_to_img(indices, args.image_size_eval)
@@ -175,5 +184,9 @@ if __name__ == "__main__":
     parser.add_argument("--temperature", type=float, default=1.0, help="temperature value to sample with")
     parser.add_argument("--top-p", type=float, default=1.0, help="top-p value to sample with")
     parser.add_argument("--debug", action="store_true", default=False)
+    parser.add_argument("--corrector-config", type=str, default="configs/corrector/corrector.yaml")
+    parser.add_argument("--corrector-ckpt", type=str, default=None)
+    parser.add_argument("--corrector-threshold", type=float, default=0.2)
+    parser.add_argument("--corrector-max-steps", type=int, default=5)
     args = parser.parse_args()
     main(args)
