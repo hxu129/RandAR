@@ -180,3 +180,9 @@ tokenizer/
 
 # Latent codes
 latents/
+
+# Debugging files
+*.json
+
+# Personal usages
+plan.md
