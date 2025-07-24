@@ -16,12 +16,13 @@ from torch.nn import functional as F
 from torch.utils.checkpoint import checkpoint
 
 from dataclasses import dataclass
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Union
 
 from .utils import DropPath, interleave_tokens, calculate_num_query_tokens_for_parallel_decoding
 from .generate import sample
 from .llamagen_gpt import LabelEmbedder, CaptionEmbedder, MLP, RMSNorm, \
     FeedForward, KVCache, find_multiple, apply_rotary_emb, precompute_freqs_cis_2d
+from .corrector import LinearCorrector, MLPCorrector, TransformerCorrector
 
 
 def batch_apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor):
@@ -447,6 +448,30 @@ class RandARTransformer(nn.Module):
         logits = self.output(h).float()
         return logits
 
+    def _forward_no_cache(
+        self,
+        h: torch.Tensor,
+        freqs_cis: torch.Tensor,
+        output_last_n: int = 0
+    ):
+        """
+        A forward inference pass without using KV cache, optionally returning hidden states.
+        """
+        hidden_states = []
+        for layer_idx, layer in enumerate(self.layers):
+            # When kv_cache is None, start_pos and mask are not used in attention
+            h = layer(h, freqs_cis, start_pos=None, mask=None)
+            if output_last_n > 0 and layer_idx >= self.n_layer - output_last_n:
+                hidden_states.append(h)
+        
+        h = self.norm(h)
+        logits = self.output(h).float()
+
+        if output_last_n > 0:
+            return logits, torch.cat(hidden_states, dim=-1)
+        else:
+            return logits, None
+
     def get_position_instruction_tokens(self, token_order):
         position_instruct_tokens = self.pos_instruct_embeddings.view(1, 1, self.n_head, self.dim // self.n_head)
         position_instruct_tokens = position_instruct_tokens.repeat(token_order.shape[0], self.block_size, 1, 1) # [1, block_size, n_head, dim // n_head]
@@ -647,3 +672,230 @@ class RandARTransformer(nn.Module):
         reverse_permutation = torch.argsort(token_order, dim=-1).long().unsqueeze(-1).expand(-1, -1, 1)
         result_indices = torch.gather(result_indices.unsqueeze(-1), 1, reverse_permutation).squeeze(-1)
         return result_indices
+
+    def generate_with_corrector(
+        self,
+        corrector: Union[LinearCorrector, MLPCorrector, TransformerCorrector],
+        corrector_threshold: float,
+        corrector_max_steps: int,
+        corrector_num_ar_layers: int,
+        cond: torch.Tensor,
+        token_order: torch.Tensor,
+        cfg_scales: Tuple[float, float] = (1.0, 1.0),
+        num_inference_steps: int = 88,
+        temperature: float = 1.0,
+        top_k: int = 0,
+        top_p: float = 1.0,
+    ):
+        """
+        Generate sequence with corrector feedback. No parallel decoding or KV cache.
+        
+        Args:
+            corrector: The corrector model to identify incorrect tokens
+            corrector_threshold: Threshold for corrector to classify tokens as incorrect  
+            corrector_max_steps: Maximum number of correction steps per generation iteration
+            corrector_num_ar_layers: Number of autoregressive layers in the corrector
+            cond: [bsz, seq_len] Conditional tokens
+            token_order: [bsz, seq_len] Original position order for each token
+            cfg_scales: Tuple (cfg_scale_start, cfg_scale_end) linear cfg scales
+            num_inference_steps: Not used in this simplified version
+            temperature: Temperature for sampling
+            top_k: Top-k for sampling
+            top_p: Top-p for sampling
+        
+        Returns:
+            result_tokens: [bsz, block_size] Generated tokens in raster order
+        """
+        bs = cond.shape[0]
+        
+        # Initialize token order if not provided
+        if token_order is None:
+            token_order = torch.arange(self.block_size, device=cond.device)
+            token_order = token_order.unsqueeze(0).repeat(bs, 1)
+            if self.position_order == "random":
+                for i in range(bs):
+                    token_order[i] = token_order[i][torch.randperm(self.block_size)]
+            token_order = token_order.contiguous()
+        else:
+            assert token_order.shape == (bs, self.block_size)
+        
+        # Store the original order for final conversion back to raster order
+        original_token_order = token_order.clone()
+        
+        # Initialize result tokens in positional order (not raster order)
+        result_tokens = torch.zeros((bs, self.block_size), dtype=torch.long, device=cond.device)
+        
+        # CFG setup
+        if cfg_scales[-1] > 1.0:
+            cond_null = torch.ones_like(cond) * self.num_classes
+            cond_combined = torch.cat([cond, cond_null])
+            bs_combined = bs * 2
+        else:
+            cond_combined = cond
+            bs_combined = bs
+        
+        # Get class embeddings
+        cond_embeddings = self.cls_embedding(cond_combined, train=False)[:, :self.cls_token_num]
+        
+        # Current generation order (can be modified by corrector)
+        current_token_order = token_order.clone()
+        tokens_generated = 0
+        
+        self.freqs_cis = self.freqs_cis.to(cond.device)
+        
+        while tokens_generated < self.block_size:
+            # === GENERATION PHASE ===
+            # Generate the next token according to current_token_order
+            next_pos_in_order = tokens_generated  # Index in the current order
+            next_pos_absolute = current_token_order[:, next_pos_in_order]  # Absolute position
+            
+            # Build input sequence for generation: [cls, pos_instruct_0, img_token_0, ...]
+            if tokens_generated == 0:
+                # First token generation: [cls, pos_instruct_0]
+                full_position_instructions = self.get_position_instruction_tokens(current_token_order)
+                position_instructions = full_position_instructions[:, :1]
+                if cfg_scales[-1] > 1.0:
+                    position_instructions = torch.cat([position_instructions, position_instructions])
+                
+                h = torch.cat([
+                    cond_embeddings,
+                    position_instructions
+                ], dim=1)
+                
+                # Frequency embeddings: [cls_freqs, pos_freq_0]
+                token_freqs = self.freqs_cis[self.cls_token_num:][current_token_order[:, :1]]
+                if cfg_scales[-1] > 1.0:
+                    token_freqs = torch.cat([token_freqs, token_freqs])
+                freqs_cis = torch.cat([
+                    self.freqs_cis[:self.cls_token_num].unsqueeze(0).repeat(bs_combined, 1, 1, 1),
+                    token_freqs
+                ], dim=1)
+                
+            else:
+                # Subsequent tokens: [cls, pos_instruct_0, img_token_0, ..., pos_instruct_n]
+                generated_tokens = torch.zeros((bs_combined, tokens_generated), dtype=torch.long, device=cond.device)
+                for i in range(tokens_generated):
+                    pos = current_token_order[:, i]
+                    generated_tokens[:bs, i] = result_tokens[torch.arange(bs), pos]
+                    if cfg_scales[-1] > 1.0:
+                        generated_tokens[bs:, i] = result_tokens[torch.arange(bs), pos]
+                
+                full_position_instructions = self.get_position_instruction_tokens(current_token_order)
+                position_instructions = full_position_instructions[:, :tokens_generated + 1]
+                if cfg_scales[-1] > 1.0:
+                    position_instructions = torch.cat([position_instructions, position_instructions])
+                
+                token_embeddings = self.tok_embeddings(generated_tokens)
+                
+                h = torch.cat([
+                    cond_embeddings,
+                    interleave_tokens(position_instructions[:, :tokens_generated], token_embeddings),
+                    position_instructions[:, tokens_generated:tokens_generated + 1]
+                ], dim=1)
+                
+                # Frequency embeddings
+                token_freqs = self.freqs_cis[self.cls_token_num:][current_token_order[:, :tokens_generated + 1]]
+                if cfg_scales[-1] > 1.0:
+                    token_freqs = torch.cat([token_freqs, token_freqs])
+                freqs_cis = torch.cat([
+                    self.freqs_cis[:self.cls_token_num].unsqueeze(0).repeat(bs_combined, 1, 1, 1),
+                    interleave_tokens(token_freqs[:, :tokens_generated], token_freqs[:, :tokens_generated]),
+                    token_freqs[:, tokens_generated:tokens_generated + 1]
+                ], dim=1)
+            
+            # TODO: check whether we need to input the rest position instructions into the model 
+            
+            # Forward pass for next token generation
+            logits, _ = self._forward_no_cache(h, freqs_cis, output_last_n=0)
+            
+            # Apply CFG
+            if cfg_scales[-1] > 1.0:
+                cfg_scale = cfg_scales[0] + (cfg_scales[-1] - cfg_scales[0]) * tokens_generated / self.block_size
+                cond_logits, uncond_logits = torch.chunk(logits, 2, dim=0)
+                logits = uncond_logits + cfg_scale * (cond_logits - uncond_logits)
+            
+            # Sample next token
+            next_token_logits = logits[:, -1:]  # Last position logits
+            next_tokens = sample(next_token_logits, temperature=temperature, top_k=top_k, top_p=top_p)[0]
+            
+            # Store the generated token at its absolute position
+            result_tokens[torch.arange(bs), next_pos_absolute] = next_tokens.squeeze(-1)
+            tokens_generated += 1
+            
+            # === CORRECTION PHASE ===
+            if tokens_generated >= self.block_size // 4:  # Need at least 1/4 of total tokens to run corrector meaningfully
+                # Build sequence for corrector evaluation - only include tokens that have been generated
+                corrector_tokens = torch.zeros((bs, tokens_generated), dtype=torch.long, device=cond.device)
+                for i in range(tokens_generated):
+                    pos = current_token_order[:, i]
+                    corrector_tokens[:, i] = result_tokens[torch.arange(bs), pos]
+                
+                # Get hidden states for corrector using _forward_no_cache
+                full_corrector_position_instructions = self.get_position_instruction_tokens(current_token_order)
+                corrector_position_instructions = full_corrector_position_instructions[:, :tokens_generated]
+                corrector_token_embeddings = self.tok_embeddings(corrector_tokens)
+                corrector_h = torch.cat([
+                    cond_embeddings[:bs],  # Only use conditional (not CFG)
+                    interleave_tokens(corrector_position_instructions, corrector_token_embeddings)
+                ], dim=1)
+                
+                corrector_token_freqs = self.freqs_cis[self.cls_token_num:][current_token_order[:, :tokens_generated]]
+                corrector_freqs_cis = torch.cat([
+                    self.freqs_cis[:self.cls_token_num].unsqueeze(0).repeat(bs, 1, 1, 1),
+                    interleave_tokens(corrector_token_freqs, corrector_token_freqs)
+                ], dim=1)
+                
+                # Get hidden states from last N layers
+                _, hidden_states = self._forward_no_cache(
+                    corrector_h, 
+                    corrector_freqs_cis, 
+                    output_last_n=corrector_num_ar_layers
+                )
+                
+                # Run corrector
+                corrector_logits = corrector(hidden_states)  # [bs, seq_len, 1]
+                
+                # Extract logits for image tokens (positions 2, 4, 6, ... in interleaved sequence)
+                image_token_logits = corrector_logits[:, 2::2, :].squeeze(-1)  # [bs, tokens_generated]
+                
+                # Identify incorrect tokens
+                incorrect_mask = image_token_logits.sigmoid() > corrector_threshold  # [bs, tokens_generated]
+                
+                # Check if any tokens need correction
+                if torch.any(incorrect_mask):
+                    # Correct logic: remove incorrect tokens and reorder queue
+                    new_token_order = current_token_order.clone()
+                    new_tokens_generated = tokens_generated
+                    
+                    for batch_idx in range(bs):
+                        if torch.any(incorrect_mask[batch_idx]):
+                            # Find positions of correct and incorrect tokens
+                            correct_indices = torch.where(~incorrect_mask[batch_idx])[0]
+                            incorrect_indices = torch.where(incorrect_mask[batch_idx])[0]
+                            
+                            # Remove incorrect tokens from result_tokens by setting them to 0 (or invalid)
+                            for idx in incorrect_indices:
+                                pos = current_token_order[batch_idx, idx]
+                                result_tokens[batch_idx, pos] = 0  # Mark as invalid
+                            
+                            # Build new order: [correct_tokens, incorrect_tokens, remaining_ungenerated_tokens]
+                            # Keep correct tokens first (for retrieval), then put incorrect tokens next for regeneration
+                            current_batch_order = current_token_order[batch_idx, :tokens_generated]
+                            remaining_tokens = current_token_order[batch_idx, tokens_generated:]
+                            
+                            reordered = torch.cat([
+                                current_batch_order[correct_indices],  # Keep correct tokens first for retrieval
+                                current_batch_order[incorrect_indices], # Put incorrect tokens next for regeneration
+                                remaining_tokens  # Then remaining ungenerated tokens
+                            ])
+                            new_token_order[batch_idx, :] = reordered
+                            
+                            # Update tokens_generated: we now have y - x valid tokens
+                            new_tokens_generated = min(new_tokens_generated, len(correct_indices))
+                    
+                    # Update generation state
+                    current_token_order = new_token_order
+                    tokens_generated = new_tokens_generated
+        
+        # result_tokens already stores tokens in raster order (absolute positions)
+        return result_tokens
