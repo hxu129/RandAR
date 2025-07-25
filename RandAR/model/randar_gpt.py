@@ -743,6 +743,11 @@ class RandARTransformer(nn.Module):
         
         self.freqs_cis = self.freqs_cis.to(cond.device)
         
+        # 多错误修复完整流程示例：
+        # 第1轮：生成4个token → 发现2个错误 → 清除错误token → 重新排队 → 回退到2个正确token
+        # 第2轮：重新生成第1个错误位置 → 无错误 → 继续
+        # 第3轮：重新生成第2个错误位置 → 无错误 → 继续
+        # 第4轮：生成剩余位置...
         while tokens_generated < self.block_size:
             # === GENERATION PHASE ===
             # Generate the next token according to current_token_order
@@ -823,12 +828,19 @@ class RandARTransformer(nn.Module):
             tokens_generated += 1
             
             # === CORRECTION PHASE ===
+            # 多错误修复示例：假设block_size=8, tokens_generated=4
+            # 当前状态：current_token_order = [[2,5,1,7,0,3,4,6]]
+            #          result_tokens = [[0,73,42,0,0,91,0,84]] (位置1,2,5,7已生成)
+            #          tokens_generated = 4
             if tokens_generated >= self.block_size // 4:  # Need at least 1/4 of total tokens to run corrector meaningfully
                 # Build sequence for corrector evaluation - only include tokens that have been generated
+                # 示例：构建已生成token序列用于纠错评估
+                # corrector_tokens将包含按生成顺序排列的token_ids: [[42,91,73,84]]
+                # 对应位置：[2,5,1,7]，但corrector按生成顺序接收
                 corrector_tokens = torch.zeros((bs, tokens_generated), dtype=torch.long, device=cond.device)
-                for i in range(tokens_generated):
-                    pos = current_token_order[:, i]
-                    corrector_tokens[:, i] = result_tokens[torch.arange(bs), pos]
+                for i in range(tokens_generated):  # i=0,1,2,3
+                    pos = current_token_order[:, i]  # pos=2,5,1,7
+                    corrector_tokens[:, i] = result_tokens[torch.arange(bs), pos]  # 42,91,73,84
                 
                 # Get hidden states for corrector using _forward_no_cache
                 full_corrector_position_instructions = self.get_position_instruction_tokens(current_token_order)
@@ -856,44 +868,59 @@ class RandARTransformer(nn.Module):
                 corrector_logits = corrector(hidden_states)  # [bs, seq_len, 1]
                 
                 # Extract logits for image tokens (positions 2, 4, 6, ... in interleaved sequence)
+                # 示例：corrector_h序列为[cls, pos_2, token_42, pos_5, token_91, pos_1, token_73, pos_7, token_84]
+                # 图像token在位置[2,4,6,8]，所以用2::2提取
                 image_token_logits = corrector_logits[:, 2::2, :].squeeze(-1)  # [bs, tokens_generated]
                 
-                # Identify incorrect tokens
+                # Identify incorrect tokens (corrector输出错误概率)
+                # 示例：假设image_token_logits.sigmoid() = [[0.2, 0.8, 0.7, 0.3]]
+                # 对应token_ids [42, 91, 73, 84]的错误概率
+                # 假设threshold=0.5，则incorrect_mask = [[False, True, True, False]]
+                # 意思是：token_91(位置5)和token_73(位置1)被认为是错误的
                 incorrect_mask = image_token_logits.sigmoid() > corrector_threshold  # [bs, tokens_generated]
                 
                 # Check if any tokens need correction
                 if torch.any(incorrect_mask):
-                    # Correct logic: remove incorrect tokens and reorder queue
+                    # 多错误修复过程：发现2个错误需要修复
+                    # incorrect_mask = [[False, True, True, False]] 对应生成顺序中的索引[1,2]
+                    # 实际位置是：位置5的token_91 和 位置1的token_73
                     new_token_order = current_token_order.clone()
                     new_tokens_generated = tokens_generated
                     
                     for batch_idx in range(bs):
                         if torch.any(incorrect_mask[batch_idx]):
                             # Find positions of correct and incorrect tokens
-                            correct_indices = torch.where(~incorrect_mask[batch_idx])[0]
-                            incorrect_indices = torch.where(incorrect_mask[batch_idx])[0]
+                            correct_indices = torch.where(~incorrect_mask[batch_idx])[0]  # [0,3] (生成顺序中的索引)
+                            incorrect_indices = torch.where(incorrect_mask[batch_idx])[0]  # [1,2] (生成顺序中的索引)
                             
                             # Remove incorrect tokens from result_tokens by setting them to 0 (or invalid)
-                            for idx in incorrect_indices:
-                                pos = current_token_order[batch_idx, idx]
-                                result_tokens[batch_idx, pos] = 0  # Mark as invalid
+                            # 清除错误token：位置5和位置1的token被标记为无效
+                            for idx in incorrect_indices:  # idx=1,2
+                                pos = current_token_order[batch_idx, idx]  # pos=5,1
+                                result_tokens[batch_idx, pos] = 0  # 清除位置5和1的token
+                            # 修复后：result_tokens = [[0,0,42,0,0,0,0,84]] 只保留正确的token
                             
                             # Build new order: [correct_tokens, incorrect_tokens, remaining_ungenerated_tokens]
-                            # Keep correct tokens first (for retrieval), then put incorrect tokens next for regeneration
-                            current_batch_order = current_token_order[batch_idx, :tokens_generated]
-                            remaining_tokens = current_token_order[batch_idx, tokens_generated:]
+                            # 重新排队：正确token优先（用于检索），错误token排在后面（准备重新生成）
+                            current_batch_order = current_token_order[batch_idx, :tokens_generated]  # [2,5,1,7]
+                            remaining_tokens = current_token_order[batch_idx, tokens_generated:]  # [0,3,4,6]
                             
+                            # correct_indices=[0,3] 对应位置[2,7]，incorrect_indices=[1,2] 对应位置[5,1]
                             reordered = torch.cat([
-                                current_batch_order[correct_indices],  # Keep correct tokens first for retrieval
-                                current_batch_order[incorrect_indices], # Put incorrect tokens next for regeneration
-                                remaining_tokens  # Then remaining ungenerated tokens
+                                current_batch_order[correct_indices],  # [2,7] 正确token的位置，优先检索
+                                current_batch_order[incorrect_indices], # [5,1] 错误token的位置，准备重新生成
+                                remaining_tokens  # [0,3,4,6] 剩余未生成的位置
                             ])
-                            new_token_order[batch_idx, :] = reordered
+                            new_token_order[batch_idx, :] = reordered  # [2,7,5,1,0,3,4,6]
                             
                             # Update tokens_generated: we now have y - x valid tokens
-                            new_tokens_generated = min(new_tokens_generated, len(correct_indices))
+                            # tokens_generated = 4 - 2 = 2，只有2个正确token保留
+                            new_tokens_generated = min(new_tokens_generated, len(correct_indices))  # min(4,2)=2
                     
                     # Update generation state
+                    # 更新后状态：current_token_order = [[2,7,5,1,0,3,4,6]]
+                    #            tokens_generated = 2
+                    #            下次将为位置5重新生成token
                     current_token_order = new_token_order
                     tokens_generated = new_tokens_generated
         
