@@ -20,6 +20,7 @@ import torch.distributed as dist
 import torch.nn.functional as F
 import torchvision.transforms as transforms
 from torch.utils.data import DataLoader
+from sklearn.metrics import f1_score
 
 import os
 import time
@@ -169,11 +170,14 @@ def compute_loss(logits, perturbed_indices):
 
     # compute accuracy
     acc = ((image_token_logits.sigmoid() > 0.5) == perturbed_indices).float().mean()
+
+    # compute f1 score
+    f1 = f1_score(perturbed_indices.float(), image_token_logits.sigmoid() > 0.5, average='macro')
     
     # Target (perturbed_indices) also has shape [bs, block_size]
     # It needs to be converted to float for the loss function
     return F.binary_cross_entropy_with_logits(image_token_logits,
-                                              perturbed_indices.float()), acc
+                                              perturbed_indices.float()), acc, f1
 
 def main(args):
     assert torch.cuda.is_available(), "Training currently requires at least one GPU."
@@ -324,7 +328,7 @@ def main(args):
 
             # 3. Forward pass through corrector
             logits = corrector(hidden_states)
-            loss, acc = compute_loss(logits, perturbed_indices)
+            loss, acc, f1 = compute_loss(logits, perturbed_indices)
             
             # 5. Backward pass
             accelerator.backward(loss)
@@ -345,8 +349,8 @@ def main(args):
                 end_time = time.time()
                 average_time = (end_time - start_time) / args.log_every
 
-                logger.info(f"Step {train_steps:08d} | Loss {average_loss:.4f} | Acc {acc:.4f} | Time {average_time:.4f}s | LR {lr_scheduler.get_last_lr()[0]:.6f}")
-                accelerator.log({"loss": average_loss, "acc": acc, "lr": lr_scheduler.get_last_lr()[0], "time": average_time}, step=train_steps)
+                logger.info(f"Step {train_steps:08d} | Loss {average_loss:.4f} | Acc {acc:.4f} | F1 {f1:.4f} | Time {average_time:.4f}s | LR {lr_scheduler.get_last_lr()[0]:.6f}")
+                accelerator.log({"loss": average_loss, "acc": acc, "f1": f1, "lr": lr_scheduler.get_last_lr()[0], "time": average_time}, step=train_steps)
                 
                 running_loss, start_time = 0, time.time()
 
