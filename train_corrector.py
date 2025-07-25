@@ -172,7 +172,9 @@ def compute_loss(logits, perturbed_indices):
     acc = ((image_token_logits.sigmoid() > 0.5) == perturbed_indices).float().mean()
 
     # compute f1 score
-    f1 = f1_score(perturbed_indices.float(), image_token_logits.sigmoid() > 0.5, average='macro')
+    f1 = f1_score(perturbed_indices.float().cpu().numpy(), 
+                  (image_token_logits.sigmoid() > 0.5).cpu().numpy(), 
+                  average='macro')
     
     # Target (perturbed_indices) also has shape [bs, block_size]
     # It needs to be converted to float for the loss function
