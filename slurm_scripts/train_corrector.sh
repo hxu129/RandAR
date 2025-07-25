@@ -14,4 +14,5 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 accelerate launch --mixed_precision=bf16 \
     --data-path $DATA_PATH/latents/pretrained/imagenet-llamagen-adm-256/imagenet-llamagen-adm-256_codes \
     --gpt-ckpt $DATA_PATH/pretrain-weights/randar_0.3b_llamagen_360k_bs_1024_lr_0.0004.safetensors \
     --resume-from /mnt/solo/image-corrector/corrector-results/test-transformer_bs_512_lr_0.0001/checkpoints/iters_00001500 \
+    --resume-wandb \
     --num-workers 16 

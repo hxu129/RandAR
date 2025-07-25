@@ -260,20 +260,6 @@ def main(args):
     )
     data_loader = cycle(data_loader)
     
-    #################### Wandb Setup ####################
-    if accelerator.is_main_process:
-        accelerator.init_trackers(
-            project_name=args.wandb_project,
-            init_kwargs={
-                "wandb": {
-                    "entity": args.wandb_entity,
-                    "config": OmegaConf.to_container(config, resolve=True),
-                    "name": args.exp_name,
-                    "dir": experiment_dir,
-                }
-            },
-        )
-        
     ################## Resume Training ##################
     train_steps = 0
     if args.resume_from:
@@ -322,6 +308,36 @@ def main(args):
             if accelerator.is_main_process:
                 logger.warning(f"Checkpoint directory name does not start with 'iters_': {ckpt_dir_name}, starting from 0")
             train_steps = 0
+
+    #################### Wandb Setup ####################
+    if accelerator.is_main_process:
+        # Setup wandb configuration based on whether we're resuming or starting fresh
+        wandb_config = {
+            "entity": args.wandb_entity,
+            "config": OmegaConf.to_container(config, resolve=True),
+            "name": args.exp_name,
+            "dir": experiment_dir,
+        }
+        
+        # If resuming from checkpoint and user wants to resume wandb, try to resume the wandb run
+        if args.resume_from and args.resume_wandb:
+            wandb_config["resume"] = "allow"  # Allow resuming if run exists, otherwise create new
+            # Use experiment name as run ID for consistent resuming
+            # This ensures we always resume the same wandb run for the same experiment
+            wandb_config["id"] = args.exp_name.replace('/', '_').replace(' ', '_')  # Clean run ID
+            if accelerator.is_main_process:
+                logger.info(f"Attempting to resume wandb run with ID: {wandb_config['id']}")
+        else:
+            # Fresh training or user chose not to resume wandb - create new run
+            wandb_config["resume"] = False
+            if args.resume_from and not args.resume_wandb:
+                if accelerator.is_main_process:
+                    logger.info("Resuming training but creating new wandb run (--resume-wandb not specified)")
+            
+        accelerator.init_trackers(
+            project_name=args.wandb_project,
+            init_kwargs={"wandb": wandb_config},
+        )
 
     #################### Training Loop ####################
     corrector.train()
@@ -453,6 +469,7 @@ if __name__ == "__main__":
 
     # Resume training
     parser.add_argument("--resume-from", type=str, default=None, help="Path to checkpoint directory to resume from")
+    parser.add_argument("--resume-wandb", action="store_true", help="Resume wandb logging when resuming from checkpoint")
 
     # Logging and Checkpointing
     parser.add_argument("--log-every", type=int, default=5)
