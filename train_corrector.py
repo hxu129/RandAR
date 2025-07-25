@@ -276,17 +276,52 @@ def main(args):
         
     ################## Resume Training ##################
     train_steps = 0
-    if False:
-    # if os.path.exists(checkpoint_dir) and len(os.listdir(checkpoint_dir)) > 0:
-        saved_ckpt_dirs = [_ for _ in os.listdir(checkpoint_dir) if _.startswith("iters")]
-        if len(saved_ckpt_dirs) > 0:
-            saved_ckpt_dirs = sorted(saved_ckpt_dirs, key=lambda x: int(x.split('_')[-1]))
-            ckpt_dir = os.path.join(checkpoint_dir, saved_ckpt_dirs[-1])
+    if args.resume_from:
+        if not os.path.exists(args.resume_from):
+            raise FileNotFoundError(f"Resume checkpoint directory not found: {args.resume_from}")
+        
+        if accelerator.is_main_process:
+            logger.info(f"Resuming from checkpoint: {args.resume_from}")
+        
+        # Temporarily patch torch.load to use weights_only=False for trusted checkpoint loading
+        # This is safe since we trust our own checkpoint files
+        original_load = torch.load
+        def patched_load(*args, **kwargs):
+            # If weights_only is not explicitly set, set it to False
+            if 'weights_only' not in kwargs:
+                kwargs['weights_only'] = False
+            return original_load(*args, **kwargs)
+        
+        torch.load = patched_load
+        try:
+            accelerator.load_state(args.resume_from)
+        finally:
+            # Restore original torch.load
+            torch.load = original_load
+        
+        # Extract train_steps from checkpoint directory name
+        # Expected format: "iters_00000500" or "iters_00000500_final"
+        ckpt_dir_name = os.path.basename(args.resume_from)
+        if ckpt_dir_name.startswith("iters_"):
+            # Split by '_' and find the numeric part
+            parts = ckpt_dir_name.split("_")
+            if len(parts) >= 2:
+                try:
+                    train_steps = int(parts[1])
+                    if accelerator.is_main_process:
+                        logger.info(f"Resuming training from step: {train_steps}")
+                except ValueError:
+                    if accelerator.is_main_process:
+                        logger.warning(f"Could not parse train_steps from {ckpt_dir_name}, starting from 0")
+                    train_steps = 0
+            else:
+                if accelerator.is_main_process:
+                    logger.warning(f"Unexpected checkpoint directory name format: {ckpt_dir_name}, starting from 0")
+                train_steps = 0
+        else:
             if accelerator.is_main_process:
-                logger.info(f"Resuming from checkpoint: {ckpt_dir}")
-            torch.serialization.add_safe_globals([ListConfig])
-            accelerator.load_state(ckpt_dir)
-            train_steps = int(saved_ckpt_dirs[-1].split("_")[-1])
+                logger.warning(f"Checkpoint directory name does not start with 'iters_': {ckpt_dir_name}, starting from 0")
+            train_steps = 0
 
     #################### Training Loop ####################
     corrector.train()
@@ -415,6 +450,9 @@ if __name__ == "__main__":
     parser.add_argument("--image-size", type=int, default=256)
     parser.add_argument("--num-classes", type=int, default=1000)
     parser.add_argument("--num-workers", type=int, default=8)
+
+    # Resume training
+    parser.add_argument("--resume-from", type=str, default=None, help="Path to checkpoint directory to resume from")
 
     # Logging and Checkpointing
     parser.add_argument("--log-every", type=int, default=5)
