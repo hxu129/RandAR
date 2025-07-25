@@ -6,9 +6,9 @@ global_seed: 0
 # Corrector Model parameters
 # We define the model we are actually training here.
 corrector_model:
-  target: RandAR.model.corrector.TransformerCorrector
+  target: RandAR.model.corrector.LinearCorrector
   params:
-    num_ar_layers_for_input: 3
+    num_ar_layers_for_input: 1
     dim: 1024
     hidden_dim: [4096, 4096]
     n_head: 16
@@ -26,7 +26,9 @@ corrector_model:
 training_params:
   max_iters: 5000
   global_batch_size: 512
+  perturb_mode: "num" # "ratio" or "num"
   perturb_ratio: 0.3 # Key hyperparameter for corrector training
+  perturb_num: 1
 
 # Optimization parameters
 optimizer:

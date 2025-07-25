@@ -54,37 +54,92 @@ def cycle(dl: torch.utils.data.DataLoader):
         for data in dl:
             yield data
 
-def perturb_image_tokens(image_tokens, perturb_ratio, vocab_size):
+def perturb_image_tokens(image_tokens, vocab_size, perturb_mode="ratio", perturb_ratio=None, perturb_num=None):
     '''
     Args:
         image_tokens: [bsz, seq_len]
-        perturb_ratio: float, the ratio of perturbed tokens
         vocab_size: int, the size of the vocabulary to sample replacements from
+        perturb_mode: str, "ratio" or "num"
+        perturb_ratio: float, the ratio of perturbed tokens
+        perturb_num: int, the number of perturbed tokens
     '''
+    # Validate parameters - prioritize perturb_num if both are provided
+    if perturb_mode not in ["ratio", "num"]:
+        raise ValueError(f"Invalid perturb_mode: {perturb_mode}, must be 'ratio' or 'num'")
+    
+    if perturb_mode == "ratio" and perturb_ratio is None:
+        raise ValueError("perturb_ratio must be provided when perturb_mode is 'ratio'")
+    
+    if perturb_mode == "num" and perturb_num is None:
+        raise ValueError("perturb_num must be provided when perturb_mode is 'num'")
+
     bs, seq_len = image_tokens.shape
     device = image_tokens.device
     
     # 1. Determine which tokens to perturb
-    # Note: this is stochastic, and the number of perturbed tokens is not guaranteed to be the same as perturb_ratio
-    perturbed_indices = torch.rand(bs, seq_len, device=device) < perturb_ratio
+    if perturb_mode == "ratio":
+        # Note: this is stochastic, and the number of perturbed tokens is not guaranteed to be the same as perturb_ratio
+        perturbed_indices = torch.rand(bs, seq_len, device=device) < perturb_ratio
+   
+        # 2. Clone original tokens and generate the exact number of replacements
+        perturbed_image_tokens = image_tokens.clone()
+        num_to_perturb = torch.sum(perturbed_indices)
     
-    # 2. Clone original tokens and generate the exact number of replacements
-    perturbed_image_tokens = image_tokens.clone()
-    num_to_perturb = torch.sum(perturbed_indices)
-    
-    if num_to_perturb > 0:
-        replacements = torch.randint(0, vocab_size, (num_to_perturb,), device=device)
-        perturbed_image_tokens[perturbed_indices] = replacements
+        if num_to_perturb > 0:
+            replacements = torch.randint(0, vocab_size, (num_to_perturb,), device=device)
+            perturbed_image_tokens[perturbed_indices] = replacements
         
-        # 3. Fix collisions: re-sample for any position that was selected for perturbation 
-        #    but randomly got assigned its original value.
-        collision_mask = (perturbed_image_tokens == image_tokens) & perturbed_indices
-        while torch.any(collision_mask):
-            num_collisions = torch.sum(collision_mask)
-            new_replacements = torch.randint(0, vocab_size, (num_collisions,), device=device)
-            perturbed_image_tokens[collision_mask] = new_replacements
-            # Update the mask to check for new collisions
+            # 3. Fix collisions: re-sample for any position that was selected for perturbation 
+            #    but randomly got assigned its original value.
             collision_mask = (perturbed_image_tokens == image_tokens) & perturbed_indices
+            while torch.any(collision_mask):
+                num_collisions = torch.sum(collision_mask)
+                new_replacements = torch.randint(0, vocab_size, (num_collisions,), device=device)
+                perturbed_image_tokens[collision_mask] = new_replacements
+                # Update the mask to check for new collisions
+                collision_mask = (perturbed_image_tokens == image_tokens) & perturbed_indices
+            
+    elif perturb_mode == "num":
+        # Deterministic number of perturbed tokens per sample
+        assert perturb_num <= seq_len, f"perturb_num ({perturb_num}) cannot be larger than seq_len ({seq_len})"
+        
+        perturbed_image_tokens = image_tokens.clone()
+        perturbed_indices = torch.zeros_like(image_tokens, dtype=torch.bool)
+        
+        if perturb_num > 0:
+            # Batch-optimized implementation for perturb_num
+            # Generate random permutations for all samples at once
+            batch_perms = torch.stack([torch.randperm(seq_len, device=device) for _ in range(bs)])
+            selected_positions = batch_perms[:, :perturb_num]  # [bs, perturb_num]
+            
+            # Create batch indices for advanced indexing
+            batch_indices = torch.arange(bs, device=device).unsqueeze(1).expand(-1, perturb_num)
+            
+            # Set perturbed indices
+            perturbed_indices[batch_indices, selected_positions] = True
+            
+            # Generate replacement tokens for all positions at once
+            replacements = torch.randint(0, vocab_size, (bs, perturb_num), device=device)
+            perturbed_image_tokens[batch_indices, selected_positions] = replacements
+            
+            # Fix collisions in batch
+            original_tokens = image_tokens[batch_indices, selected_positions]
+            collision_mask = (perturbed_image_tokens[batch_indices, selected_positions] == original_tokens)
+            
+            while torch.any(collision_mask):
+                # Find positions that need re-sampling
+                collision_batch_idx, collision_pos_idx = torch.where(collision_mask)
+                num_collisions = len(collision_batch_idx)
+                
+                if num_collisions > 0:
+                    new_replacements = torch.randint(0, vocab_size, (num_collisions,), device=device)
+                    collision_positions = selected_positions[collision_batch_idx, collision_pos_idx]
+                    perturbed_image_tokens[collision_batch_idx, collision_positions] = new_replacements
+                    
+                    # Update collision mask
+                    collision_mask = (perturbed_image_tokens[batch_indices, selected_positions] == original_tokens)
+                else:
+                    break
             
     return perturbed_image_tokens, perturbed_indices # [bsz, seq_len], [bsz, seq_len]
 
@@ -365,8 +420,10 @@ def main(args):
 
             perturbed_tokens, perturbed_indices = perturb_image_tokens(
                 permuted_image_tokens,
-                config.training_params.perturb_ratio,
-                config.corrector_model.params.vocab_size
+                config.corrector_model.params.vocab_size,
+                perturb_mode=config.training_params.perturb_mode,
+                perturb_ratio=config.training_params.perturb_ratio,
+                perturb_num=config.training_params.perturb_num
             )
 
             # 2. Get hidden states from the frozen gpt model
