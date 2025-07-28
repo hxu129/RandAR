@@ -615,7 +615,8 @@ def main(args):
             perturbed_tokens, perturbed_indices = perturb_image_tokens(
                 permuted_image_tokens,
                 config.corrector_model.params.vocab_size,
-                supervision_mode=config.training_params.supervision_mode,
+                # supervision_mode=config.training_params.supervision_mode,
+                supervision_mode="replacement",
                 perturb_mode=config.training_params.perturb_mode,
                 perturb_ratio=config.training_params.perturb_ratio,
                 perturb_num=config.training_params.perturb_num,
