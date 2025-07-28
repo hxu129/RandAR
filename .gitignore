@@ -186,3 +186,6 @@ latents/
 
 # Personal usages
 plan.md
+
+# inception model
+*.pb
