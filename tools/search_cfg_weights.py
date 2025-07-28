@@ -212,7 +212,7 @@ def main(args):
             json.dump(eval_results, f)
     
     # report the results
-    total_samples = int(math.ceil(args.num_fid_samples_report / global_batch_size) * global_batch_size)
+    total_samples = int(math.ceil(args.num_fid_samples_final / global_batch_size) * global_batch_size)
     optimal_cfg_scale = float(min(eval_results, key=lambda x: eval_results[x]["fid"]))
     fid, sfid, IS, precision, recall = sample_and_eval(
         tokenizer, gpt_model, optimal_cfg_scale, args, device, total_samples)
