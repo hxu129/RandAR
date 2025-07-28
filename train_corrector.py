@@ -425,10 +425,16 @@ def compute_loss(logits, perturbed_indices):
                   (image_token_logits.sigmoid() > 0.5).cpu().numpy(), 
                   average='macro')
     
+    # compute pos_weight for the loss function
+    pos_ratio = perturbed_indices.float().mean()
+    neg_ratio = 1 - pos_ratio
+    pos_weight = neg_ratio / pos_ratio
+    
     # Target (perturbed_indices) also has shape [bs, block_size]
     # It needs to be converted to float for the loss function
     return F.binary_cross_entropy_with_logits(image_token_logits,
-                                              perturbed_indices.float()), acc, f1
+                                              perturbed_indices.float(),
+                                              pos_weight=pos_weight), acc, f1
 
 def main(args):
     assert torch.cuda.is_available(), "Training currently requires at least one GPU."
