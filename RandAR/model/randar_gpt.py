@@ -673,7 +673,137 @@ class RandARTransformer(nn.Module):
         result_indices = torch.gather(result_indices.unsqueeze(-1), 1, reverse_permutation).squeeze(-1)
         return result_indices
 
+
     def generate_with_corrector(
+        self,
+        cond: torch.Tensor,
+        token_order: torch.Tensor,
+        cfg_scales: Tuple[float, float] = (1.0, 1.0),
+        num_inference_steps: int = 88,
+        temperature: float = 1.0,
+        top_k: int = 0,
+        top_p: float = 1.0,
+        corrector: Union[LinearCorrector, MLPCorrector, TransformerCorrector] = None,
+        corrector_threshold: float = 0.5,
+        corrector_max_steps: int = 10,
+        corrector_num_ar_layers: int = 1,
+    ):
+        """ Args:
+            cond: [bsz, seq_len] Conditional tokens
+            token_order: [bsz, seq_len] Position order for each token
+            cfg_scales: Tuple (cfg_scale_start, cfg_scale_end) linear cfg scales, set start=end for constant cfg_scale
+            num_inference_steps: int Number of inference steps, set to -1 or the number of image tokens to disable parallel decoding
+            temperature: float Temperature for sampling
+            top_k: int Top-k for sampling
+            top_p: float Top-p for sampling
+            corrector: The corrector model to identify incorrect tokens
+            corrector_threshold: Threshold for corrector to classify tokens as incorrect  
+            corrector_max_steps: Maximum number of correction steps per generation iteration
+            corrector_num_ar_layers: Number of autoregressive layers in the corrector
+        """
+        bs = cond.shape[0]
+        
+        # Step-1: Generate the token orders and result sequences
+        if token_order is None:
+            token_order = torch.arange(self.block_size, device=cond.device)
+            token_order = token_order.unsqueeze(0).repeat(bs, 1)
+            token_order = token_order.contiguous()
+            if self.position_order == "random":
+                for i in range(bs):
+                    token_order[i] = token_order[i][torch.randperm(self.block_size)]
+            token_order = token_order.contiguous()
+        else:
+            assert token_order.shape == (bs, self.block_size)
+        
+        result_indices = torch.zeros((bs, self.block_size), dtype=torch.long, device=cond.device)
+        
+        # Step-2: Prepare the freqs_cis and position_instruction_tokens
+        position_instruction_tokens = self.get_position_instruction_tokens(token_order)
+        img_token_freq_cis = self.freqs_cis[self.cls_token_num:].clone().to(token_order.device)[token_order]
+
+        # Step-3: Prepare CFG
+        if cfg_scales[-1] > 1.0:
+            cond_null = torch.ones_like(cond) * self.num_classes
+            cond_combined = torch.cat([cond, cond_null])
+            img_token_freq_cis = torch.cat([img_token_freq_cis, img_token_freq_cis]).to(token_order.device)
+            position_instruction_tokens = torch.cat([position_instruction_tokens, position_instruction_tokens]).to(token_order.device)
+            bs *= 2
+        else:
+            cond_combined = cond
+        cond_combined_tokens = self.cls_embedding(cond_combined, train=False)
+    
+        # Step-4: KV Cache is removed
+
+        # Step-5: Autoregressive generation with parallel decoding
+        if num_inference_steps == -1:
+            # if -1, one token at a time, no parallel decoding
+            num_inference_steps = self.block_size
+        
+        cur_inference_step = 0
+        num_query_token_cur_step = 1 # how many tokens to decode at this step
+        query_token_idx_cur_step = 0 # the index of the first token to decode at this step
+
+        # Step 5-2: Start the loop
+        while query_token_idx_cur_step < self.block_size:
+            # Step 5-3: Decode the current step tokens by constructing the full input sequence
+            generated_indices = result_indices[:, :query_token_idx_cur_step]
+            generated_embeds = self.tok_embeddings(generated_indices)
+            if cfg_scales[-1] > 1.0:
+                generated_embeds = torch.cat([generated_embeds, generated_embeds], dim=0)
+
+            pos_instr_hist = position_instruction_tokens[:, :query_token_idx_cur_step]
+            pos_instr_query = position_instruction_tokens[:, query_token_idx_cur_step : query_token_idx_cur_step + num_query_token_cur_step]
+
+            if query_token_idx_cur_step > 0:
+                x = torch.cat([cond_combined_tokens, interleave_tokens(pos_instr_hist, generated_embeds), pos_instr_query], dim=1)
+            else:
+                x = torch.cat([cond_combined_tokens, pos_instr_query], dim=1)
+
+            img_token_freq_cis_hist = img_token_freq_cis[:, :query_token_idx_cur_step]
+            img_token_freq_cis_query = img_token_freq_cis[:, query_token_idx_cur_step : query_token_idx_cur_step + num_query_token_cur_step].to(token_order.device)
+            class_freqs = self.freqs_cis[:self.cls_token_num].unsqueeze(0).repeat(bs, 1, 1, 1).to(token_order.device)
+
+            if query_token_idx_cur_step > 0:
+                cur_freqs_cis = torch.cat([class_freqs, interleave_tokens(img_token_freq_cis_hist, img_token_freq_cis_hist), img_token_freq_cis_query], dim=1)
+            else:
+                cur_freqs_cis = torch.cat([class_freqs, img_token_freq_cis_query], dim=1)
+
+            logits, _ = self._forward_no_cache(x, cur_freqs_cis)
+
+            # apply CFG
+            if cfg_scales[-1] > 1.0:
+                cur_cfg_scale = cfg_scales[0] + (cfg_scales[-1] - cfg_scales[0]) * query_token_idx_cur_step / self.block_size
+                cond_logits, uncond_logits = torch.chunk(logits, 2, dim=0)
+                logits = uncond_logits + cur_cfg_scale * (cond_logits - uncond_logits)
+
+            # query tokens' logits and indices
+            logits = logits[:, -num_query_token_cur_step:] # [bs, query_num, vocab_size]
+            indices = torch.zeros(result_indices.shape[0], num_query_token_cur_step, dtype=torch.long, device=cond.device)
+            for i in range(num_query_token_cur_step):
+                indices[:, i : i + 1] = sample(logits[:, i : i + 1], temperature=temperature, top_k=top_k, top_p=top_p)[0]
+            
+            # save the result tokens
+            result_indices[:, query_token_idx_cur_step : query_token_idx_cur_step + num_query_token_cur_step] = indices.clone()
+            
+            # Step 5-4: Prepare for the next step
+            cur_inference_step += 1
+            num_query_token_next_step = calculate_num_query_tokens_for_parallel_decoding(
+                cur_inference_step, num_inference_steps, self.block_size, 
+                query_token_idx_cur_step, num_query_token_cur_step)
+            
+            query_token_idx_cur_step += num_query_token_cur_step
+            num_query_token_cur_step = num_query_token_next_step
+
+            if query_token_idx_cur_step >= self.block_size:
+                break
+        
+        # Step 6: Return to raster order for tokenizer decoding
+        reverse_permutation = torch.argsort(token_order, dim=-1).long().unsqueeze(-1).expand(-1, -1, 1)
+        result_indices = torch.gather(result_indices.unsqueeze(-1), 1, reverse_permutation).squeeze(-1)
+        return result_indices
+
+
+    def generate_with_corrector_original(
         self,
         corrector: Union[LinearCorrector, MLPCorrector, TransformerCorrector],
         corrector_threshold: float,
@@ -802,9 +932,13 @@ class RandARTransformer(nn.Module):
                 token_freqs = self.freqs_cis[self.cls_token_num:][current_token_order[:, :tokens_generated + 1]]
                 if cfg_scales[-1] > 1.0:
                     token_freqs = torch.cat([token_freqs, token_freqs])
+                
+                # Correctly interleave frequencies for position and generated tokens
+                interleaved_freqs = interleave_tokens(token_freqs[:, :tokens_generated], token_freqs[:, :tokens_generated])
+                
                 freqs_cis = torch.cat([
                     self.freqs_cis[:self.cls_token_num].unsqueeze(0).repeat(bs_combined, 1, 1, 1),
-                    interleave_tokens(token_freqs[:, :tokens_generated], token_freqs[:, :tokens_generated]),
+                    interleaved_freqs,
                     token_freqs[:, tokens_generated:tokens_generated + 1]
                 ], dim=1)
             
@@ -832,7 +966,8 @@ class RandARTransformer(nn.Module):
             # 当前状态：current_token_order = [[2,5,1,7,0,3,4,6]]
             #          result_tokens = [[0,73,42,0,0,91,0,84]] (位置1,2,5,7已生成)
             #          tokens_generated = 4
-            if tokens_generated >= self.block_size // 4:  # Need at least 1/4 of total tokens to run corrector meaningfully
+            if False:
+            # if tokens_generated >= self.block_size // 4:  # Need at least 1/4 of total tokens to run corrector meaningfully
                 # Build sequence for corrector evaluation - only include tokens that have been generated
                 # 示例：构建已生成token序列用于纠错评估
                 # corrector_tokens将包含按生成顺序排列的token_ids: [[42,91,73,84]]
