@@ -194,6 +194,9 @@ def main(args):
     # To make things evenly-divisible, we'll sample a bit more than we need and then discard the extra samples:
     total_samples = int(math.ceil(args.num_fid_samples_search / global_batch_size) * global_batch_size)
 
+    result_file_name = (f"{args.results_path}/{args.exp_name}-{ckpt_string_name}-"
+                        f"size-{args.image_size}-size-{args.image_size_eval}-search.json")
+
     # CFG scales to be searched
     eval_results = {}
     cfg_scales_search = args.cfg_scales_search.split(",")
@@ -204,9 +207,6 @@ def main(args):
     else:
         cfg_scales_list = np.arange(cfg_scales_search[0], cfg_scales_search[1] + 1e-4, cfg_scales_interval)
         print(f"CFG scales to be searched: {cfg_scales_list}")
-
-        result_file_name = (f"{args.results_path}/{args.exp_name}-{ckpt_string_name}-"
-                            f"size-{args.image_size}-size-{args.image_size_eval}-search.json")
 
         # run throught the CFG scales
         for cfg_scale in cfg_scales_list:
@@ -230,7 +230,7 @@ def main(args):
     gpt_model.eval()
     corrector_model.eval()
     tokenizer.eval()
-    with torch.no_grad() and torch.autocast(device_type="cuda", dtype=precision):
+    with torch.no_grad() and torch.inference_mode() and torch.autocast(device_type="cuda", dtype=precision):
         fid, sfid, IS, precision, recall = sample_and_eval(
             tokenizer, gpt_model, corrector_model, optimal_cfg_scale, args, device, total_samples, corrector_config.corrector_model.params.num_ar_layers_for_input)
     
