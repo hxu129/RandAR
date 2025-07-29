@@ -745,6 +745,7 @@ class RandARTransformer(nn.Module):
         query_token_idx_cur_step = 0 # the index of the first token to decode at this step
 
         # Step 5-2: Start the loop
+        flag = 0
         while query_token_idx_cur_step < self.block_size:
             # Step 5-3: Decode the current step tokens by constructing the full input sequence
             generated_indices = result_indices[:, :query_token_idx_cur_step]
@@ -793,7 +794,9 @@ class RandARTransformer(nn.Module):
             #     query_token_idx_cur_step, num_query_token_cur_step)
             
             query_token_idx_cur_step += num_query_token_cur_step
-            num_query_token_cur_step = min(4, self.block_size - query_token_idx_cur_step) # TODO: future improvement: use the corrector to determine the number of query tokens
+            # num_query_token_cur_step = min(4, self.block_size - query_token_idx_cur_step) # TODO: future improvement: use the corrector to determine the number of query tokens
+            num_query_token_cur_step = 1
+            flag += 1
             print(f"query_token_idx_cur_step: {query_token_idx_cur_step}") 
             # num_query_token_cur_step = num_query_token_next_step
 
@@ -803,7 +806,7 @@ class RandARTransformer(nn.Module):
                 break
         
             # Step 6: Corrector
-            if corrector and query_token_idx_cur_step > self.block_size // 2 and num_query_token_cur_step != num_errors: # TODO: note that in the future this should be a argument related to num_errors
+            if False and corrector and query_token_idx_cur_step > self.block_size // 2 and num_query_token_cur_step != num_errors and flag >= 4: # TODO: note that in the future this should be a argument related to num_errors
                 corrector.eval()
                 with torch.no_grad() and torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                     
@@ -871,6 +874,8 @@ class RandARTransformer(nn.Module):
                     # num_query_token_cur_step = num_query_token_next_step
                     query_token_idx_cur_step -= num_errors
                     num_query_token_cur_step = num_query_token_cur_step # TODO: in the future here might need to change
+
+                flag = 0
 
         # Step 6: Return to raster order for tokenizer decoding
         reverse_permutation = torch.argsort(token_order, dim=-1).long().unsqueeze(-1).expand(-1, -1, 1)
