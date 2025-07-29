@@ -806,7 +806,7 @@ class RandARTransformer(nn.Module):
                 break
         
             # Step 6: Corrector
-            if False and corrector and query_token_idx_cur_step > self.block_size // 2 and num_query_token_cur_step != num_errors and flag >= 4: # TODO: note that in the future this should be a argument related to num_errors
+            if corrector and query_token_idx_cur_step > self.block_size // 1.5 and num_query_token_cur_step != num_errors and flag >= 5: # TODO: note that in the future this should be a argument related to num_errors
                 corrector.eval()
                 with torch.no_grad() and torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                     
