@@ -794,13 +794,16 @@ class RandARTransformer(nn.Module):
             
             query_token_idx_cur_step += num_query_token_cur_step
             num_query_token_cur_step = min(4, self.block_size - query_token_idx_cur_step) # TODO: future improvement: use the corrector to determine the number of query tokens
+            print(f"query_token_idx_cur_step: {query_token_idx_cur_step}") 
             # num_query_token_cur_step = num_query_token_next_step
 
+            num_errors = 2
+    
             if query_token_idx_cur_step >= self.block_size:
                 break
         
             # Step 6: Corrector
-            if corrector and query_token_idx_cur_step > self.block_size // 2: # TODO: note that in the future this should be a argument related to num_errors
+            if corrector and query_token_idx_cur_step > self.block_size // 2 and num_query_token_cur_step != num_errors: # TODO: note that in the future this should be a argument related to num_errors
                 corrector.eval()
                 with torch.no_grad() and torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                     
@@ -818,11 +821,9 @@ class RandARTransformer(nn.Module):
                     corr_logits = corr_logits.squeeze(-1)[:, self.cls_token_num::2]
 
                     # Step 6-3: Select tokens to correct
-                    num_errors = 2
                     # Sort indices by error score in descending order (most likely error first)
-                    sorted_indices = torch.argsort(corr_logits, dim=-1, descending=True)
-                    error_pos = sorted_indices[:, :num_errors]
-                    non_error_pos = sorted_indices[:, num_errors:]
+                    error_pos = torch.topk(corr_logits, k=num_errors, dim=-1, largest=True)[1]
+                    non_error_pos = torch.stack([torch.tensor([j for j in range(query_token_idx_cur_step) if j not in error_pos[i]]) for i in range(bs)]).to(cond.device)
                 
 
                     # Step 6-4: Update the token order and the tokens
