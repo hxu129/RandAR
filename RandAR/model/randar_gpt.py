@@ -812,8 +812,18 @@ class RandARTransformer(nn.Module):
                     corr_freqs_cis = torch.cat([class_freqs, 
                                                 interleave_tokens(corr_freq_cis, corr_freq_cis)], dim=1)
                     new_embeds = self.tok_embeddings(result_indices[:, :query_token_idx_cur_step])
-                    corr_x = torch.cat([cond_combined_tokens, 
-                                        interleave_tokens(position_instruction_tokens[:, :query_token_idx_cur_step], new_embeds)], dim=1)
+                    # remove cfg from position instruction tokens
+                    corr_bs = bs // 2 if cfg_scales[-1] > 1.0 else bs
+                    corr_position_instruction_tokens = position_instruction_tokens[:, :query_token_idx_cur_step]
+                    if cfg_scales[-1] > 1.0:
+                        corr_position_instruction_tokens = corr_position_instruction_tokens[:corr_bs]
+                        corr_cond_combined_tokens = cond_combined_tokens[:corr_bs]
+                        corr_freqs_cis = corr_freqs_cis[:corr_bs]
+                    else:
+                        corr_cond_combined_tokens = cond_combined_tokens
+                        corr_freqs_cis = corr_freqs_cis
+                    corr_x = torch.cat([corr_cond_combined_tokens, 
+                                        interleave_tokens(corr_position_instruction_tokens, new_embeds)], dim=1)
                     _, hidden_states = self._forward_no_cache(corr_x, corr_freqs_cis, output_last_n=corrector_num_ar_layers)
             
                     # Step 6-2: Run the corrector
@@ -823,7 +833,7 @@ class RandARTransformer(nn.Module):
                     # Step 6-3: Select tokens to correct
                     # Sort indices by error score in descending order (most likely error first)
                     error_pos = torch.topk(corr_logits, k=num_errors, dim=-1, largest=True)[1]
-                    non_error_pos = torch.stack([torch.tensor([j for j in range(query_token_idx_cur_step) if j not in error_pos[i]]) for i in range(bs)]).to(cond.device)
+                    non_error_pos = torch.stack([torch.tensor([j for j in range(query_token_idx_cur_step) if j not in error_pos[i]]) for i in range(corr_bs)]).to(cond.device)
                 
 
                     # Step 6-4: Update the token order and the tokens
@@ -846,7 +856,12 @@ class RandARTransformer(nn.Module):
                     position_instruction_tokens = self.get_position_instruction_tokens(token_order)
                     img_token_freq_cis = freqs_cis[self.cls_token_num:][token_order]
 
-                    # Step 6-6: Update the counting variables
+                    # Step 6-6: Update the CFG for the next step (generate with CFG)
+                    if cfg_scales[-1] > 1.0:
+                        position_instruction_tokens = torch.cat([position_instruction_tokens, position_instruction_tokens], dim=0)
+                        img_token_freq_cis = torch.cat([img_token_freq_cis, img_token_freq_cis], dim=0)
+
+                    # Step 6-7: Update the counting variables
                     # cur_inference_step += 1
                     # num_query_token_next_step = calculate_num_query_tokens_for_parallel_decoding(
                     #     cur_inference_step, num_inference_steps, self.block_size, 
