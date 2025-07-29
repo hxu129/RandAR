@@ -199,31 +199,34 @@ def main(args):
     cfg_scales_search = args.cfg_scales_search.split(",")
     cfg_scales_search = [float(cfg_scale) for cfg_scale in cfg_scales_search]
     cfg_scales_interval = float(args.cfg_scales_interval)
-    cfg_scales_list = np.arange(cfg_scales_search[0], cfg_scales_search[1] + 1e-4, cfg_scales_interval)
-    print(f"CFG scales to be searched: {cfg_scales_list}")
+    if cfg_scales_search[0] == cfg_scales_search[1]:
+        optimal_cfg_scale = cfg_scales_search[0]
+    else:
+        cfg_scales_list = np.arange(cfg_scales_search[0], cfg_scales_search[1] + 1e-4, cfg_scales_interval)
+        print(f"CFG scales to be searched: {cfg_scales_list}")
 
-    result_file_name = (f"{args.results_path}/{args.exp_name}-{ckpt_string_name}-"
-                        f"size-{args.image_size}-size-{args.image_size_eval}-search.json")
+        result_file_name = (f"{args.results_path}/{args.exp_name}-{ckpt_string_name}-"
+                            f"size-{args.image_size}-size-{args.image_size_eval}-search.json")
 
-    # run throught the CFG scales
-    for cfg_scale in cfg_scales_list:
-        fid, sfid, IS, precision, recall = sample_and_eval(
-            tokenizer, gpt_model, corrector_model, cfg_scale, args, device, total_samples, corrector_config.corrector_model.params.num_ar_layers_for_input)
-        eval_results[f"{cfg_scale:.2f}"] = {
-            "fid": fid,
-            "sfid": sfid,
-            "IS": IS,
-            "precision": precision,
-            "recall": recall
-        }
-        print(f"Eval results for CFG scale {cfg_scale:.2f}: {eval_results[f'{cfg_scale:.2f}']}")
+        # run throught the CFG scales
+        for cfg_scale in cfg_scales_list:
+            fid, sfid, IS, precision, recall = sample_and_eval(
+                tokenizer, gpt_model, corrector_model, cfg_scale, args, device, total_samples, corrector_config.corrector_model.params.num_ar_layers_for_input)
+            eval_results[f"{cfg_scale:.2f}"] = {
+                "fid": fid,
+                "sfid": sfid,
+                "IS": IS,
+                "precision": precision,
+                "recall": recall
+            }
+            print(f"Eval results for CFG scale {cfg_scale:.2f}: {eval_results[f'{cfg_scale:.2f}']}")
 
-        with open(result_file_name, "w") as f:
-            json.dump(eval_results, f)
+            with open(result_file_name, "w") as f:
+                json.dump(eval_results, f)
     
-    # report the results
+        # report the results
+        optimal_cfg_scale = float(min(eval_results, key=lambda x: eval_results[x]["fid"]))
     total_samples = int(math.ceil(args.num_fid_samples_final / global_batch_size) * global_batch_size)
-    optimal_cfg_scale = float(min(eval_results, key=lambda x: eval_results[x]["fid"]))
     fid, sfid, IS, precision, recall = sample_and_eval(
         tokenizer, gpt_model, corrector_model, optimal_cfg_scale, args, device, total_samples, corrector_config.corrector_model.params.num_ar_layers_for_input)
     
