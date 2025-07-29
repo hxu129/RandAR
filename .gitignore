@@ -189,3 +189,6 @@ plan.md
 
 # inception model
 *.pb
+
+# original paper
+*.tex

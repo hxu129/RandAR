@@ -227,8 +227,12 @@ def main(args):
         # report the results
         optimal_cfg_scale = float(min(eval_results, key=lambda x: eval_results[x]["fid"]))
     total_samples = int(math.ceil(args.num_fid_samples_final / global_batch_size) * global_batch_size)
-    fid, sfid, IS, precision, recall = sample_and_eval(
-        tokenizer, gpt_model, corrector_model, optimal_cfg_scale, args, device, total_samples, corrector_config.corrector_model.params.num_ar_layers_for_input)
+    gpt_model.eval()
+    corrector_model.eval()
+    tokenizer.eval()
+    with torch.no_grad() and torch.autocast(device_type="cuda", dtype=precision):
+        fid, sfid, IS, precision, recall = sample_and_eval(
+            tokenizer, gpt_model, corrector_model, optimal_cfg_scale, args, device, total_samples, corrector_config.corrector_model.params.num_ar_layers_for_input)
     
     print(f"Optimal CFG scale: {optimal_cfg_scale:.2f}")
     print(f"Eval results for optimal CFG scale: {fid, sfid, IS, precision, recall}")
