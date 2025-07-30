@@ -110,7 +110,7 @@ def sample_and_eval(tokenizer, gpt_model, corrector_model, cfg_scale, args, devi
     
         for i, sample in enumerate(samples):
             index = i * dist.get_world_size() + rank + total
-            Image.fromarray(sample).save(f"{sample_folder_dir}/{index:06d}.png")
+            Image.fromarray(sample).save(f"{sample_folder_dir}/{c_indices[i]:06d}_{index:06d}.png")
         total += global_batch_size
         cur_iter += 1
         # I use this line to look at the initial images to check the correctness
