@@ -467,9 +467,9 @@ def main(args):
                 end_time = time.time()
                 average_time = (end_time - start_time) / args.log_every
 
-                logger.info(f"Step {train_steps:08d} | Loss {average_loss:.4f} | Acc {acc:.4f} | Time {average_time:.4f}s | LR {lr_scheduler.get_last_lr()[0]:.6f}")
-                accelerator.log({"loss": average_loss, "acc": acc, "lr": lr_scheduler.get_last_lr()[0], "time": average_time}, step=train_steps)
-                
+                logger.info(f"Step {train_steps:08d} | Loss {average_loss:.4f} | Acc {acc:.4f} | F1 {f1:.4f} | Time {average_time:.4f}s | LR {lr_scheduler.get_last_lr()[0]:.6f}")
+                accelerator.log({"loss": average_loss, "acc": acc, "f1": f1, "lr": lr_scheduler.get_last_lr()[0], "time": average_time}, step=train_steps)
+
                 running_loss, start_time = 0, time.time()
 
             if train_steps % args.ckpt_every == 0 and accelerator.is_main_process:
@@ -538,7 +538,7 @@ if __name__ == "__main__":
     parser.add_argument("--keep-last-k", type=int, default=3)
 
     # W&B
-    parser.add_argument("--wandb-entity", type=str, default="hxu129-hkust")
+    parser.add_argument("--wandb-entity", type=str, default="notjuice-university-of-wisconsin-madison")
     parser.add_argument("--wandb-project", type=str, default="image-corrector-cvpr-26")
     parser.add_argument("--wandb-offline", action="store_true")
     parser.add_argument("--disk-location", type=str, default='')
