@@ -54,179 +54,121 @@ def cycle(dl: torch.utils.data.DataLoader):
         for data in dl:
             yield data
 
-def perturb_image_tokens_adversarial(image_tokens, vocab_size, perturb_mode="ratio", perturb_ratio=None, perturb_num=None, ar_model=None, token_order=None, class_tokens=None):
-    '''Train the corrector to tell the generated tokens and the original tokens apart.
-    
-    Example logic flow (BATCH PROCESSING + OPTIMIZED - no forward pass for condition tokens):
-    Batch size=2, Original tokens: 
-    - Sample 0: [A, B, C, D] (positions 0,1,2,3)  
-    - Sample 1: [E, F, G, H] (positions 0,1,2,3)
-    - perturb_ratio=0.5 → perturb_count=2
-    
-    Step 1: Restore to raster order (batch operation)
-    - original_tokens = [[A,B,C,D], [E,F,G,H]] ✓
-    
-    Step 2: Select perturbation positions (same for all samples)
-    - perturb_positions = [0,1], condition_positions = [2,3]
-    
-    Step 3: Create random orders for ALL samples
-    - condition_orders = [[3,2], [2,3]] (different random order per sample)
-    - perturb_orders = [[0,1], [1,0]] (different random order per sample)
-    
-    Step 4: Batch generation (all samples processed together)
-    - Step 0: Generate pos [0,1] for samples [0,1]
-      Input batch: [CLS, pos_3, D, pos_2, C, pos_0] and [CLS, pos_2, G, pos_3, H, pos_1]
-      → Forward pass for entire batch → Sample [X₀, Y₁] 
-    - Step 1: Generate pos [1,0] for samples [0,1]  
-      Input batch: [CLS, pos_3, D, pos_2, C, pos_0, X₀, pos_1] and [CLS, pos_2, G, pos_3, H, pos_1, Y₁, pos_0]
-      → Forward pass for entire batch → Sample [Y₀, X₁]
-    - Results: [[X₀,Y₀,C,D], [X₁,Y₁,G,H]]
-    
-    Step 5: Batch rearrange back to token_order
-    - Batch gather operation for all samples simultaneously
-    
-    Performance: Only perturb_count forward passes for entire batch (vs seq_len × batch_size before)!
+def perturb_image_tokens_adversarial(
+    gpt_model: RandARTransformer,
+    image_tokens: torch.Tensor,
+    cond_tokens: torch.Tensor,
+    token_order: torch.Tensor,
+    perturb_ratio: float = None,
+    perturb_num: int = None,
+    perturb_mode: str = "ratio"
+):
+    """
+    Efficiently generates perturbed tokens using a pre-trained RandAR model for adversarial training.
     
     Args:
-        image_tokens: [bsz, seq_len] image tokens already permuted according to token_order
-        vocab_size: int, the size of the vocabulary to sample replacements from
-        perturb_mode: str, "ratio" or "num"
-        perturb_ratio: float, the ratio of perturbed tokens (deterministic now)
-        perturb_num: int, the number of perturbed tokens
-        ar_model: RandARTransformer model for generation
-        token_order: [bsz, seq_len] the permutation order used for image_tokens
-        class_tokens: [bsz] class tokens for conditional generation
-    Returns:
-        perturbed_tokens: [bsz, seq_len] tokens with some positions replaced by AR-generated tokens
-        perturbed_mask: [bsz, seq_len] boolean mask indicating which positions were perturbed
-    '''
-    # Validate parameters
-    if perturb_mode not in ["ratio", "num"]:
-        raise ValueError(f"Invalid perturb_mode: {perturb_mode}, must be 'ratio' or 'num'")
-    
-    if perturb_mode == "ratio" and perturb_ratio is None:
-        raise ValueError("perturb_ratio must be provided when perturb_mode is 'ratio'")
-    
-    if perturb_mode == "num" and perturb_num is None:
-        raise ValueError("perturb_num must be provided when perturb_mode is 'num'")
-    
-    if class_tokens is None:
-        raise ValueError("class_tokens must be provided for conditional generation")
-
+        gpt_model: Pre-trained, frozen RandAR model.
+        image_tokens: [bs, seq_len] image tokens, already permuted by token_order.
+        cond_tokens: [bs] Class condition tokens.
+        token_order: [bs, seq_len] The permutation order used for image_tokens.
+        perturb_ratio: float, ratio of tokens to perturb (used in "ratio" mode).
+        perturb_num: int, number of tokens to perturb (used in "num" mode).
+        perturb_mode: str, perturbation mode ("ratio" or "num").
+    """
     bs, seq_len = image_tokens.shape
     device = image_tokens.device
-    
-    # Step 1: Restore to original raster order
-    inverse_order = torch.argsort(token_order, dim=1)
-    original_tokens = torch.gather(image_tokens, 1, inverse_order)  # [bs, seq_len] in raster order
-    
-    # Step 2: Determine perturbation positions (deterministic)
+
+    # 1. Determine positions to perturb and create a boolean mask.
     if perturb_mode == "ratio":
-        perturb_count = int(seq_len * perturb_ratio)
+        if perturb_ratio is None: perturb_ratio = 0.2
+        perturbed_indices = torch.rand(bs, seq_len, device=device) < perturb_ratio
+    elif perturb_mode == "num":
+        if perturb_num is None: perturb_num = 1
+        perturb_num = min(perturb_num, seq_len)
+        perturbed_indices = torch.zeros_like(image_tokens, dtype=torch.bool)
+        if perturb_num > 0:
+            # Efficiently select `perturb_num` random indices per sample.
+            row_indices = torch.arange(bs, device=device).unsqueeze(1)
+            col_indices = torch.rand(bs, seq_len, device=device).topk(perturb_num, dim=1).indices
+            perturbed_indices[row_indices, col_indices] = True
     else:
-        perturb_count = perturb_num
-    
-    perturb_count = min(perturb_count, seq_len)
-    
-    # Deterministic selection: always select the first perturb_count positions for perturbation
-    perturb_positions = torch.arange(perturb_count, device=device)  # [0, 1, ..., perturb_count-1]
-    condition_positions = torch.arange(perturb_count, seq_len, device=device)  # [perturb_count, ..., seq_len-1]
-    
-    # Step 3: Create random generation order (condition tokens first, then perturbed tokens)
-    # Batch processing: create random orders for all samples at once
-    result_tokens = original_tokens.clone()
-    perturbed_mask = torch.zeros((bs, seq_len), dtype=torch.bool, device=device)
-    
-    # Mark perturbed positions in raster order
-    perturbed_mask[:, perturb_positions] = True
-    
-    # Create random orders for all batch samples
-    condition_orders = torch.stack([
-        condition_positions[torch.randperm(len(condition_positions), device=device)] 
-        for _ in range(bs)
-    ])  # [bs, len(condition_positions)]
-    
-    perturb_orders = torch.stack([
-        perturb_positions[torch.randperm(len(perturb_positions), device=device)]
-        for _ in range(bs)  
-    ])  # [bs, len(perturb_positions)]
-    
-    # Step 4: Initialize with condition tokens (no forward pass needed)
-    # All condition positions already have correct values
-    raster_tokens = original_tokens.clone()  # [bs, seq_len]
-    
-    # Step 5: Generate perturbed tokens using batch processing
-    class_embeddings = ar_model.cls_embedding(class_tokens, train=False)[:, :ar_model.cls_token_num]  # [bs, cls_token_num, dim]
-    ar_model.freqs_cis = ar_model.freqs_cis.to(device)
-    
-    # Generate perturbed tokens one position at a time (but all batch samples together)
-    for step in range(perturb_count):
-        # Current perturbed positions for all samples
-        current_perturb_positions = perturb_orders[:, step]  # [bs]
-        
-        # Already generated perturbed positions for all samples
-        already_generated_perturb = perturb_orders[:, :step]  # [bs, step]
-        
-        # Create generation order for all samples: [condition_order, already_generated_perturb, current_perturb]
-        # Each sample has: len(condition_positions) + step + 1 positions
-        current_seq_len = len(condition_positions) + step + 1
-        current_generation_orders = torch.zeros((bs, current_seq_len), dtype=torch.long, device=device)
-        
-        # Fill in the generation orders
-        current_generation_orders[:, :len(condition_positions)] = condition_orders
-        if step > 0:
-            current_generation_orders[:, len(condition_positions):len(condition_positions)+step] = already_generated_perturb
-        current_generation_orders[:, -1] = current_perturb_positions
-        
-        # Create token_order for position instructions (pad to seq_len for get_position_instruction_tokens)
-        padded_token_orders = torch.zeros((bs, seq_len), dtype=torch.long, device=device)
-        padded_token_orders[:, :current_seq_len] = current_generation_orders
-        
-        # Get position instruction tokens for all samples
-        pos_instruct_tokens = ar_model.get_position_instruction_tokens(padded_token_orders)  # [bs, seq_len, dim]
-        pos_instruct_tokens = pos_instruct_tokens[:, :current_seq_len]  # [bs, current_seq_len, dim]
-        
-        # Prepare input tokens for all samples (exclude the position we're generating)
-        batch_indices = torch.arange(bs, device=device).unsqueeze(1)  # [bs, 1]
-        prev_positions = current_generation_orders[:, :-1]  # [bs, current_seq_len-1]
-        current_tokens = raster_tokens[batch_indices, prev_positions]  # [bs, current_seq_len-1]
-        token_embeddings = ar_model.tok_embeddings(current_tokens)  # [bs, current_seq_len-1, dim]
-        
-        # Build input sequence for all samples: [CLS, pos_0, token_0, pos_1, token_1, ..., pos_current]
-        h = torch.cat([
-            class_embeddings,  # [bs, cls_token_num, dim]
-            interleave_tokens(pos_instruct_tokens[:, :-1], token_embeddings),  # [bs, 2*(current_seq_len-1), dim]
-            pos_instruct_tokens[:, -1:]  # [bs, 1, dim] - current position instruction
-        ], dim=1)  # [bs, cls_token_num + 2*(current_seq_len-1) + 1, dim]
-        
-        # Prepare frequency embeddings for all samples
-        batch_token_freqs = ar_model.freqs_cis[ar_model.cls_token_num:][current_generation_orders]  # [bs, current_seq_len, ...]
-        freqs_cis = torch.cat([
-            ar_model.freqs_cis[:ar_model.cls_token_num].unsqueeze(0).repeat(bs, 1, 1, 1),  # [bs, cls_token_num, ...]
-            interleave_tokens(batch_token_freqs[:, :-1], batch_token_freqs[:, :-1]),  # [bs, 2*(current_seq_len-1), ...]
-            batch_token_freqs[:, -1:]  # [bs, 1, ...]
-        ], dim=1)
-        
-        # Batch forward pass to generate current perturbed tokens
-        with torch.no_grad():
-            ar_model.eval()
-            logits, _ = ar_model._forward_no_cache(h, freqs_cis, output_last_n=0)  # [bs, seq_len_total, vocab_size]
-        
-        # Sample new tokens for all perturbed positions
-        current_logits = logits[:, -1, :]  # [bs, vocab_size] - last position logits for each sample
-        probs = F.softmax(current_logits, dim=-1)
-        generated_tokens = torch.multinomial(probs, 1).squeeze(-1)  # [bs]
-        
-        # Update tokens at perturbed positions for all samples
-        raster_tokens[batch_indices.squeeze(1), current_perturb_positions] = generated_tokens
-    
-    # Step 6: Rearrange from raster order back to original token_order for all samples
-    result_tokens = torch.gather(raster_tokens, 1, token_order)
-    
-    # Convert perturbed_mask from raster order to token_order
-    perturbed_mask_reordered = torch.gather(perturbed_mask, 1, token_order)
-    
-    return result_tokens, perturbed_mask_reordered
+        # Fallback to default ratio mode.
+        perturbed_indices = torch.rand(bs, seq_len, device=device) < 0.2
+
+    # Clone original tokens to start with.
+    perturbed_image_tokens = image_tokens.clone()
+
+    # If no tokens are selected for perturbation, return early.
+    if not torch.any(perturbed_indices):
+        return perturbed_image_tokens, perturbed_indices
+
+    # 2. Perform a single forward pass with the RandAR model to get all logits.
+    with torch.no_grad():
+        gpt_model.eval()
+
+        cond_embeddings = gpt_model.cls_embedding(cond_tokens, train=False)[:, :gpt_model.cls_token_num]
+        token_embeddings = gpt_model.tok_embeddings(image_tokens)
+        pos_instruct_tokens = gpt_model.get_position_instruction_tokens(token_order)
+
+        h = torch.cat(
+            (cond_embeddings, interleave_tokens(pos_instruct_tokens, token_embeddings)),
+            dim=1
+        )
+
+        gpt_model.freqs_cis = gpt_model.freqs_cis.to(device)
+        token_freqs_cis_ordered = gpt_model.freqs_cis[gpt_model.cls_token_num:].clone()[token_order]
+        freqs_cis = torch.cat(
+            (gpt_model.freqs_cis[:gpt_model.cls_token_num].unsqueeze(0).repeat(bs, 1, 1, 1),
+             interleave_tokens(token_freqs_cis_ordered, token_freqs_cis_ordered)),
+            dim=1
+        )
+
+        for layer in gpt_model.layers:
+            h = layer(h, freqs_cis, start_pos=None, mask=None)
+
+        h = gpt_model.norm(h)
+        logits = gpt_model.output(h).float()
+        # --- End of forward pass ---
+
+        # 3. Sample and replace tokens efficiently.
+
+        # Select logits for image token positions from the interleaved sequence.
+        # Shape: [bs, seq_len, vocab_size]
+        image_token_logits = logits[:, gpt_model.cls_token_num + 1::2, :]
+
+        # Use the boolean mask to gather logits for all positions to be perturbed.
+        # Shape: [num_total_perturbations, vocab_size]
+        logits_to_sample = image_token_logits[perturbed_indices]
+
+        # Sample new tokens for all positions in a single operation.
+        temperature = 1.0
+        probs = torch.softmax(logits_to_sample / temperature, dim=-1)
+        new_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)
+
+        # Place the newly generated tokens back into their positions in one go.
+        perturbed_image_tokens[perturbed_indices] = new_tokens
+
+        # 4. Handle sampling collisions (new_token == old_token).
+        # This is rare but handled for correctness.
+        collision_mask = (perturbed_image_tokens == image_tokens) & perturbed_indices
+        max_attempts = 10
+        attempts = 0
+        while torch.any(collision_mask) and attempts < max_attempts:
+            # Gather logits for collided positions.
+            collided_logits = image_token_logits[collision_mask]
+            
+            # Resample.
+            new_probs = torch.softmax(collided_logits / temperature, dim=-1)
+            replacements = torch.multinomial(new_probs, num_samples=1).squeeze(1)
+
+            # Place replacements back into collided positions.
+            perturbed_image_tokens[collision_mask] = replacements
+            
+            # Update collision mask for the next check.
+            collision_mask = (perturbed_image_tokens == image_tokens) & perturbed_indices
+            attempts += 1
+
+    return perturbed_image_tokens, perturbed_indices
 
 def perturb_image_tokens_replacement(image_tokens, vocab_size, perturb_mode="ratio", perturb_ratio=None, perturb_num=None):
     '''Train the corrector to tell the replacement tokens and the original tokens apart.
