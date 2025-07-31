@@ -367,6 +367,24 @@ def compute_loss(logits, perturbed_indices):
     f1 = f1_score(perturbed_indices.float().cpu().numpy(), 
                   (image_token_logits.sigmoid() > 0.5).cpu().numpy(), 
                   average='macro')
+
+    # compute top k accuracy: 1, 5, 10, 15
+    k_range = [15, 10, 5, 3, 2, 1]
+    top_k_prob, top_k_pos = image_token_logits.sigmoid().topk(max(k_range), dim=-1, sorted=True)
+
+    top_k_acc = {}
+    top_k_mean_prob = {}
+
+    for k in k_range:
+        current_top_k_pos = top_k_pos[:, :k]
+
+        # Use advanced indexing instead of torch.gather for better readability.
+        bs = perturbed_indices.shape[0]
+        batch_indices = torch.arange(bs, device=perturbed_indices.device).unsqueeze(1)
+        ground_truth_at_top_k = perturbed_indices[batch_indices, current_top_k_pos]
+        
+        top_k_acc[k] = ground_truth_at_top_k.float().mean()
+        top_k_mean_prob[k] = top_k_prob[:, :k].mean()
     
     # compute pos_weight for the loss function
     pos_ratio = perturbed_indices.float().mean()
@@ -377,7 +395,9 @@ def compute_loss(logits, perturbed_indices):
     # It needs to be converted to float for the loss function
     return F.binary_cross_entropy_with_logits(image_token_logits,
                                               perturbed_indices.float(),
-                                              pos_weight=pos_weight), acc, f1
+                                              pos_weight=pos_weight), \
+                                              acc, f1, \
+                                              top_k_acc, top_k_mean_prob
 
 def main(args):
     assert torch.cuda.is_available(), "Training currently requires at least one GPU."
@@ -585,7 +605,7 @@ def main(args):
 
             # 3. Forward pass through corrector
             logits = corrector(hidden_states)
-            loss, acc, f1 = compute_loss(logits, perturbed_indices)
+            loss, acc, f1, top_k_acc, top_k_mean_prob = compute_loss(logits, perturbed_indices)
             
             # 5. Backward pass
             accelerator.backward(loss)
@@ -607,7 +627,23 @@ def main(args):
                 average_time = (end_time - start_time) / args.log_every
 
                 logger.info(f"Step {train_steps:08d} | Loss {average_loss:.4f} | Acc {acc:.4f} | F1 {f1:.4f} | Time {average_time:.4f}s | LR {lr_scheduler.get_last_lr()[0]:.6f}")
-                accelerator.log({"loss": average_loss, "acc": acc, "f1": f1, "lr": lr_scheduler.get_last_lr()[0], "time": average_time}, step=train_steps)
+                accelerator.log({"loss": average_loss, 
+                                 "acc": acc, 
+                                 "f1": f1, 
+                                 "top_1_acc": top_k_acc[1],
+                                 "top_2_acc": top_k_acc[2],
+                                 "top_3_acc": top_k_acc[3],
+                                 "top_5_acc": top_k_acc[5],
+                                 "top_10_acc": top_k_acc[10],
+                                 "top_15_acc": top_k_acc[15],
+                                 "top_1_mean_prob": top_k_mean_prob[1],
+                                 "top_2_mean_prob": top_k_mean_prob[2],
+                                 "top_3_mean_prob": top_k_mean_prob[3],
+                                 "top_5_mean_prob": top_k_mean_prob[5],
+                                 "top_10_mean_prob": top_k_mean_prob[10],
+                                 "top_15_mean_prob": top_k_mean_prob[15],
+                                 "lr": lr_scheduler.get_last_lr()[0], 
+                                 "time": average_time}, step=train_steps)
                 
                 running_loss, start_time = 0, time.time()
 
