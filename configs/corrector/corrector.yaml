@@ -8,24 +8,25 @@ global_seed: 0
 corrector_model:
   target: RandAR.model.corrector.TransformerCorrector
   params:
+    # shared parameters
     num_ar_layers_for_input: 3
     dim: 1024
+    # mlp parameters
     hidden_dim: [4096, 4096]
-    n_head: 16
-    n_layer: 12 # A reasonable starting point, can be tuned
+    # transformer parameters
+    num_heads: 8
+    num_transformer_layers: 2
     dropout: 0.1
+    # script parameters
+    vocab_size: 16384
     cls_token_num: 1
     block_size: 256
-    vocab_size: 16384
     rope_base: 10000
-
-    num_transformer_layers: 2
-    num_head: 8
 
 # Training parameters
 training_params:
-  max_iters: 5000
-  global_batch_size: 512
+  max_iters: 100000
+  global_batch_size: 128
   supervision_mode: "adversarial" # "adversarial" or "replacement"
   perturb_mode: "ratio" # "ratio" or "num"
   perturb_ratio: 0.3 # Key hyperparameter for corrector training
@@ -34,7 +35,7 @@ training_params:
 # Optimization parameters
 optimizer:
   target: torch.optim.AdamW
-  lr: 1.0e-4
+  lr: 3.0e-4
   weight_decay: 0.05
   betas: [0.9, 0.95]
   max_grad_norm: 1.0
@@ -44,12 +45,12 @@ optimizer:
 # Learning rate scheduler
 lr_scheduler:
   type: "cosine"
-  warm_up_iters: 2000
+  warm_up_iters: 1000
   min_lr_ratio: 0.1
   num_cycles: 1
 
 # Accelerator configuration for mixed precision and gradient accumulation
 accelerator:
   mixed_precision: "bf16"
-  gradient_accumulation_steps: 1
+  gradient_accumulation_steps: 2
   log_with: "wandb" 
