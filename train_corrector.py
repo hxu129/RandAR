@@ -124,8 +124,15 @@ def perturb_image_tokens_adversarial(
             dim=1
         )
 
+        # Prepare causal mask for the sequence.
+        total_seq_len = h.shape[1]
+        causal_mask = torch.triu(
+            torch.full((total_seq_len, total_seq_len), float('-inf'), device=device),
+            diagonal=1
+        )
+
         for layer in gpt_model.layers:
-            h = layer(h, freqs_cis, start_pos=None, mask=None)
+            h = layer(h, freqs_cis, start_pos=None, mask=causal_mask)
 
 
         h = gpt_model.norm(h)
