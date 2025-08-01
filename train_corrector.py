@@ -124,8 +124,16 @@ def perturb_image_tokens_adversarial(
             dim=1
         )
 
+        # Prepare causal mask for the sequence.
+        total_seq_len = h.shape[1]
+        causal_mask = torch.triu(
+            torch.full((total_seq_len, total_seq_len), float('-inf'), device=device),
+            diagonal=1
+        )
+
         for layer in gpt_model.layers:
-            h = layer(h, freqs_cis, start_pos=None, mask=None)
+            h = layer(h, freqs_cis, start_pos=None, mask=causal_mask)
+
 
         h = gpt_model.norm(h)
         logits = gpt_model.output(h).float()
@@ -168,6 +176,15 @@ def perturb_image_tokens_adversarial(
             # Update collision mask for the next check.
             collision_mask = (perturbed_image_tokens == image_tokens) & perturbed_indices
             attempts += 1
+
+        # 5. Shuffle the perturbed sequence and recompute labels.
+        bs, seq_len = perturbed_image_tokens.shape
+        for i in range(bs):
+            shuffle_order = torch.randperm(seq_len, device=perturbed_image_tokens.device)
+            original_shuffled = image_tokens[i][shuffle_order]
+            perturbed_image_tokens[i] = perturbed_image_tokens[i][shuffle_order]
+            # Recompute which positions are perturbed after shuffling
+            perturbed_indices[i] = (perturbed_image_tokens[i] != original_shuffled)
 
     return perturbed_image_tokens, perturbed_indices
 
