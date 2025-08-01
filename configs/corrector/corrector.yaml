@@ -14,8 +14,14 @@ corrector_model:
     # mlp parameters
     hidden_dim: [4096, 4096]
     # transformer parameters
-    num_heads: 8
+    transformer_dim: 512
+    num_attention_heads: 8
+    qkv_bias: True
     num_transformer_layers: 2
+    mlp_ratio: 4.0
+    layer_norm_eps: 1e-5
+    drop_path_rate: 0.0
+    layer_scale_value: 1.0
     dropout: 0.1
     # script parameters
     vocab_size: 16384
@@ -38,7 +44,7 @@ optimizer:
   lr: 3.0e-4
   weight_decay: 0.05
   betas: [0.9, 0.95]
-  max_grad_norm: 1.0
+  max_grad_norm: -1
   skip_grad_norm: 100.0 # if grad norm > this, skip optimizer step
   skip_grad_iter: 1000 # always step for the first N iters
 
@@ -52,5 +58,5 @@ lr_scheduler:
 # Accelerator configuration for mixed precision and gradient accumulation
 accelerator:
   mixed_precision: "bf16"
-  gradient_accumulation_steps: 2
+  gradient_accumulation_steps: 1
   log_with: "wandb" 
