@@ -40,7 +40,7 @@ def create_npz_from_sample_folder(sample_dir, num=50_000):
             sample_np = np.asarray(sample_pil).astype(np.uint8)
             samples.append(sample_np)
     samples = np.stack(samples)
-    # assert samples.shape == (num, samples.shape[1], samples.shape[2], 3)
+    assert samples.shape == (num, samples.shape[1], samples.shape[2], 3)
     npz_path = f"{sample_dir}.npz"
     np.savez(npz_path, arr_0=samples)
     print(f"Saved .npz file to {npz_path} [shape={samples.shape}].")
