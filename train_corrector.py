@@ -54,6 +54,69 @@ def cycle(dl: torch.utils.data.DataLoader):
         for data in dl:
             yield data
 
+def check_randar_prediction_quality(
+    logits: torch.Tensor,
+    ground_truth_tokens: torch.Tensor,
+    perturbed_indices: torch.Tensor,
+    threshold: float = 0.1,
+    log_details: bool = False
+):
+    """
+    检查RandAR模型对扰动位置真实token的预测质量
+    
+    Args:
+        logits: [bs, seq_len, vocab_size] RandAR输出的logits
+        ground_truth_tokens: [bs, seq_len] 真实的token
+        perturbed_indices: [bs, seq_len] 扰动位置的mask
+        threshold: float, 认为预测概率"高"的阈值
+        log_details: bool, 是否记录详细信息
+    
+    Returns:
+        dict: 包含扰动位置预测质量指标的字典
+    """
+    with torch.no_grad():
+        bs, seq_len, vocab_size = logits.shape
+        device = logits.device
+        
+        # 1. 计算真实token的预测概率
+        probs = torch.softmax(logits, dim=-1)
+        
+        # 使用高级索引获取真实token的概率
+        batch_indices = torch.arange(bs, device=device).unsqueeze(1)  # [bs, 1]
+        pos_indices = torch.arange(seq_len, device=device).unsqueeze(0)  # [1, seq_len]
+        gt_probs = probs[batch_indices, pos_indices, ground_truth_tokens]  # [bs, seq_len]
+        
+        # 2. 只分析扰动位置
+        perturbed_mask = perturbed_indices.bool()
+        
+        if not perturbed_mask.any():
+            # 如果没有扰动位置，返回默认值
+            metrics = {
+                'perturbed_gt_prob_mean': torch.tensor(0.0, device=device),
+                'perturbed_gt_prob_std': torch.tensor(0.0, device=device),
+                'perturbed_high_confidence_ratio': torch.tensor(0.0, device=device),
+                'perturbed_count': torch.tensor(0, device=device),
+            }
+        else:
+            # 提取扰动位置的预测概率
+            perturbed_gt_probs = gt_probs[perturbed_mask]
+            
+            metrics = {
+                'perturbed_gt_prob_mean': perturbed_gt_probs.mean(),
+                'perturbed_gt_prob_std': perturbed_gt_probs.std(),
+                'perturbed_high_confidence_ratio': (perturbed_gt_probs > threshold).float().mean(),
+                'perturbed_count': perturbed_mask.sum(),
+            }
+        
+        # 3. 记录详细信息
+        if log_details and perturbed_mask.any():
+            print(f"RandAR Perturbed Positions Quality:")
+            print(f"  Count: {metrics['perturbed_count']}")
+            print(f"  GT Probability: {metrics['perturbed_gt_prob_mean']:.4f} ± {metrics['perturbed_gt_prob_std']:.4f}")
+            print(f"  High Confidence Ratio (>{threshold}): {metrics['perturbed_high_confidence_ratio']:.4f}")
+        
+        return metrics
+
 def perturb_image_tokens_adversarial(
     image_tokens: torch.Tensor,
     vocab_size: int,
@@ -101,7 +164,14 @@ def perturb_image_tokens_adversarial(
 
     # If no tokens are selected for perturbation, return early.
     if not torch.any(perturbed_indices):
-        return perturbed_image_tokens, perturbed_indices
+        # Create dummy prediction quality for consistency
+        dummy_quality = {
+            'perturbed_gt_prob_mean': torch.tensor(0.0, device=device),
+            'perturbed_gt_prob_std': torch.tensor(0.0, device=device),
+            'perturbed_high_confidence_ratio': torch.tensor(0.0, device=device),
+            'perturbed_count': torch.tensor(0, device=device),
+        }
+        return perturbed_image_tokens, perturbed_indices, dummy_quality
 
     # 2. Perform a single forward pass with the RandAR model to get all logits.
     with torch.no_grad():
@@ -139,11 +209,20 @@ def perturb_image_tokens_adversarial(
         logits = gpt_model.output(h).float()
         # --- End of forward pass ---
 
-        # 3. Sample and replace tokens efficiently.
-
         # Select logits for image token positions from the interleaved sequence.
         # Shape: [bs, seq_len, vocab_size]
         image_token_logits = logits[:, gpt_model.cls_token_num + 1::2, :]
+
+        # Check RandAR prediction quality BEFORE perturbation
+        prediction_quality = check_randar_prediction_quality(
+            logits=image_token_logits,
+            ground_truth_tokens=image_tokens,
+            perturbed_indices=perturbed_indices,
+            threshold=0.1,
+            log_details=False  # Set to True for debugging
+        )
+
+        # 3. Sample and replace tokens efficiently.
 
         # Use the boolean mask to gather logits for all positions to be perturbed.
         # Shape: [num_total_perturbations, vocab_size]
@@ -186,7 +265,7 @@ def perturb_image_tokens_adversarial(
             # Recompute which positions are perturbed after shuffling
             perturbed_indices[i] = (perturbed_image_tokens[i] != original_shuffled)
 
-    return perturbed_image_tokens, perturbed_indices
+    return perturbed_image_tokens, perturbed_indices, prediction_quality
 
 def perturb_image_tokens_replacement(image_tokens, vocab_size, perturb_mode="ratio", perturb_ratio=None, perturb_num=None):
     '''Train the corrector to tell the replacement tokens and the original tokens apart.
@@ -378,8 +457,7 @@ def compute_loss(logits, perturbed_indices):
     image_token_logits = image_token_logits.squeeze(-1) # Shape: [bs, block_size]
 
     # compute accuracy
-    pred_pos = image_token_logits.sigmoid() > 0.5
-    acc = ((image_token_logits.sigmoid() > 0.5) == perturbed_indices).float().mean() # (tp + tn) / (tp + tn + fp + fn)
+    acc = ((image_token_logits.sigmoid() > 0.5) == perturbed_indices).float().mean()
 
     # compute f1 score
     f1 = f1_score(perturbed_indices.float().cpu().numpy(), 
@@ -388,27 +466,21 @@ def compute_loss(logits, perturbed_indices):
 
     # compute top k accuracy: 1, 5, 10, 15
     k_range = [15, 10, 5, 3, 2, 1]
-    top_k_prob, top_k_pos = image_token_logits.sigmoid().topk(max(k_range), dim=-1, largest=True, sorted=True)
+    top_k_prob, top_k_pos = image_token_logits.sigmoid().topk(max(k_range), dim=-1, sorted=True)
 
     top_k_acc = {}
     top_k_mean_prob = {}
 
-    bs = perturbed_indices.shape[0]
-    batch_indices = torch.arange(bs, device=perturbed_indices.device).unsqueeze(1)
     for k in k_range:
         current_top_k_pos = top_k_pos[:, :k]
 
         # Use advanced indexing instead of torch.gather for better readability.
+        bs = perturbed_indices.shape[0]
+        batch_indices = torch.arange(bs, device=perturbed_indices.device).unsqueeze(1)
         ground_truth_at_top_k = perturbed_indices[batch_indices, current_top_k_pos]
         
-        top_k_acc[k] = ground_truth_at_top_k.float().mean() # (tp) / (tp + tn + fp + fn)
+        top_k_acc[k] = ground_truth_at_top_k.float().mean()
         top_k_mean_prob[k] = top_k_prob[:, :k].mean()
-
-    # compute more meaningful metrics
-    tp_rate = (perturbed_indices[pred_pos] == 1).float().sum() / (pred_pos).float().sum() # True positive rate, real positive / total predicted positive
-    fp_rate = (perturbed_indices[pred_pos] == 0).float().sum() / (pred_pos).float().sum() # False positive rate, real negative / total predicted positive
-    fn_rate = (perturbed_indices[~pred_pos] == 1).float().sum() / (~pred_pos).float().sum() # False negative rate, real positive / total predicted negative
-    tn_rate = (perturbed_indices[~pred_pos] == 0).float().sum() / (~pred_pos).float().sum() # True negative rate, real negative / total predicted negative
     
     # compute pos_weight for the loss function
     pos_ratio = perturbed_indices.float().mean()
@@ -421,8 +493,7 @@ def compute_loss(logits, perturbed_indices):
                                               perturbed_indices.float(),
                                               pos_weight=pos_weight), \
                                               acc, f1, \
-                                              top_k_acc, top_k_mean_prob, \
-                                              tp_rate, fp_rate, fn_rate, tn_rate
+                                              top_k_acc, top_k_mean_prob
 
 def main(args):
     assert torch.cuda.is_available(), "Training currently requires at least one GPU."
@@ -606,7 +677,7 @@ def main(args):
             
             permuted_image_tokens = torch.gather(image_tokens, 1, token_order)
 
-            perturbed_tokens, perturbed_indices = perturb_image_tokens(
+            result = perturb_image_tokens(
                 permuted_image_tokens,
                 config.corrector_model.params.vocab_size,
                 supervision_mode=config.training_params.supervision_mode,
@@ -617,6 +688,19 @@ def main(args):
                 token_order=token_order,
                 class_tokens=y # Pass class tokens to the wrapper
             )
+
+            # Handle different return formats
+            prediction_quality = None
+            if config.training_params.supervision_mode == "adversarial":
+                if len(result) == 3:
+                    perturbed_tokens, perturbed_indices, prediction_quality = result
+                elif len(result) == 5: # For backward compatibility
+                    perturbed_tokens, perturbed_indices, _, _, prediction_quality = result
+                else: # Fallback for older versions
+                    perturbed_tokens, perturbed_indices = result
+            else:
+                # Standard format (replacement mode)
+                perturbed_tokens, perturbed_indices = result
 
             # 2. Get hidden states from the frozen gpt model
             logits, hidden_states = get_last_n_hidden_states(
@@ -630,7 +714,7 @@ def main(args):
 
             # 3. Forward pass through corrector
             logits = corrector(hidden_states)
-            loss, acc, f1, top_k_acc, top_k_mean_prob, tp_rate, fp_rate, fn_rate, tn_rate = compute_loss(logits, perturbed_indices)
+            loss, acc, f1, top_k_acc, top_k_mean_prob = compute_loss(logits, perturbed_indices)
             
             # 5. Backward pass
             accelerator.backward(loss)
@@ -652,27 +736,43 @@ def main(args):
                 average_time = (end_time - start_time) / args.log_every
 
                 logger.info(f"Step {train_steps:08d} | Loss {average_loss:.4f} | Acc {acc:.4f} | F1 {f1:.4f} | Time {average_time:.4f}s | LR {lr_scheduler.get_last_lr()[0]:.6f}")
-                accelerator.log({"loss": average_loss, 
-                                 "acc": acc, 
-                                 "f1": f1, 
-                                 "top_1_acc": top_k_acc[1],
-                                 "top_2_acc": top_k_acc[2],
-                                 "top_3_acc": top_k_acc[3],
-                                 "top_5_acc": top_k_acc[5],
-                                 "top_10_acc": top_k_acc[10],
-                                 "top_15_acc": top_k_acc[15],
-                                 "top_1_mean_prob": top_k_mean_prob[1],
-                                 "top_2_mean_prob": top_k_mean_prob[2],
-                                 "top_3_mean_prob": top_k_mean_prob[3],
-                                 "top_5_mean_prob": top_k_mean_prob[5],
-                                 "top_10_mean_prob": top_k_mean_prob[10],
-                                 "top_15_mean_prob": top_k_mean_prob[15],
-                                 "tp_rate": tp_rate.item(),
-                                 "fp_rate": fp_rate.item(),
-                                 "fn_rate": fn_rate.item(),
-                                 "tn_rate": tn_rate.item(),
-                                 "lr": lr_scheduler.get_last_lr()[0], 
-                                 "time": average_time}, step=train_steps)
+                
+                # Prepare logging metrics
+                log_metrics = {
+                    "loss": average_loss, 
+                    "acc": acc, 
+                    "f1": f1, 
+                    "top_1_acc": top_k_acc[1],
+                    "top_2_acc": top_k_acc[2],
+                    "top_3_acc": top_k_acc[3],
+                    "top_5_acc": top_k_acc[5],
+                    "top_10_acc": top_k_acc[10],
+                    "top_15_acc": top_k_acc[15],
+                    "top_1_mean_prob": top_k_mean_prob[1],
+                    "top_2_mean_prob": top_k_mean_prob[2],
+                    "top_3_mean_prob": top_k_mean_prob[3],
+                    "top_5_mean_prob": top_k_mean_prob[5],
+                    "top_10_mean_prob": top_k_mean_prob[10],
+                    "top_15_mean_prob": top_k_mean_prob[15],
+                    "lr": lr_scheduler.get_last_lr()[0], 
+                    "time": average_time
+                }
+                
+                # Add RandAR prediction quality metrics if available
+                if prediction_quality is not None:
+                    for key, value in prediction_quality.items():
+                        if torch.is_tensor(value):
+                            log_metrics[f"randar_perturbed/{key}"] = value.item()
+                        else:
+                            log_metrics[f"randar_perturbed/{key}"] = value
+                    
+                    # Additional detailed logging every few steps
+                    if train_steps % (args.log_every * 5) == 0:
+                        logger.info(f"RandAR Perturbed - Count: {prediction_quality['perturbed_count']}")
+                        logger.info(f"RandAR Perturbed - GT Prob: {prediction_quality['perturbed_gt_prob_mean']:.4f}±{prediction_quality['perturbed_gt_prob_std']:.4f}")
+                        logger.info(f"RandAR Perturbed - High Confidence: {prediction_quality['perturbed_high_confidence_ratio']:.4f}")
+                
+                accelerator.log(log_metrics, step=train_steps)
                 
                 running_loss, start_time = 0, time.time()
 
