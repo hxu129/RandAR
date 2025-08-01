@@ -448,7 +448,7 @@ def check_randar_prediction_quality(
     ground_truth_tokens: torch.Tensor,
     perturbed_indices: torch.Tensor,
     threshold: float = 0.1,
-    log_details: bool = False
+    log_details: bool = False,
 ):
     """
     检查RandAR模型对扰动位置真实token的预测质量
@@ -468,7 +468,7 @@ def check_randar_prediction_quality(
         device = logits.device
         
         # 1. 计算真实token的预测概率
-        probs = torch.softmax(logits, dim=-1)
+        probs = torch.softmax(logits, dim=-1) # [bs, seq_len, vocab_size]
         
         # 使用高级索引获取真实token的概率
         batch_indices = torch.arange(bs, device=device).unsqueeze(1)  # [bs, 1]
@@ -485,16 +485,23 @@ def check_randar_prediction_quality(
                 'perturbed_gt_prob_std': torch.tensor(0.0, device=device),
                 'perturbed_high_confidence_ratio': torch.tensor(0.0, device=device),
                 'perturbed_count': torch.tensor(0, device=device),
+                'perturbed_rank': torch.tensor(0, device=device),
             }
         else:
             # 提取扰动位置的预测概率
             perturbed_gt_probs = gt_probs[perturbed_mask]
-            
+
+            # get perturbed rank
+            perturbed_rank = (probs > gt_probs.unsqueeze(-1)) # [bs, seq_len, vocab_size]
+            perturbed_rank = perturbed_rank.sum(dim=-1) # [bs, seq_len]
+            perturbed_rank = perturbed_rank[perturbed_mask].float().mean()
+
             metrics = {
                 'perturbed_gt_prob_mean': perturbed_gt_probs.mean(),
                 'perturbed_gt_prob_std': perturbed_gt_probs.std(),
                 'perturbed_high_confidence_ratio': (perturbed_gt_probs > threshold).float().mean(),
                 'perturbed_count': perturbed_mask.sum(),
+                'perturbed_rank': perturbed_rank,
             }
         
         # 3. 记录详细信息
@@ -786,6 +793,7 @@ def main(args):
                         logger.info(f"RandAR Perturbed - Count: {prediction_quality['perturbed_count']}")
                         logger.info(f"RandAR Perturbed - GT Prob: {prediction_quality['perturbed_gt_prob_mean']:.4f}±{prediction_quality['perturbed_gt_prob_std']:.4f}")
                         logger.info(f"RandAR Perturbed - High Confidence: {prediction_quality['perturbed_high_confidence_ratio']:.4f}")
+                        logger.info(f"RandAR Perturbed - Rank: {prediction_quality['perturbed_rank']:.4f}")
                 
                 accelerator.log(log_metrics, step=train_steps)
                 
