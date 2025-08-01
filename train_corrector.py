@@ -361,7 +361,8 @@ def compute_loss(logits, perturbed_indices):
     image_token_logits = image_token_logits.squeeze(-1) # Shape: [bs, block_size]
 
     # compute accuracy
-    acc = ((image_token_logits.sigmoid() > 0.5) == perturbed_indices).float().mean()
+    pred_pos = image_token_logits.sigmoid() > 0.5
+    acc = ((image_token_logits.sigmoid() > 0.5) == perturbed_indices).float().mean() # (tp + tn) / (tp + tn + fp + fn)
 
     # compute f1 score
     f1 = f1_score(perturbed_indices.float().cpu().numpy(), 
@@ -370,21 +371,27 @@ def compute_loss(logits, perturbed_indices):
 
     # compute top k accuracy: 1, 5, 10, 15
     k_range = [15, 10, 5, 3, 2, 1]
-    top_k_prob, top_k_pos = image_token_logits.sigmoid().topk(max(k_range), dim=-1, sorted=True)
+    top_k_prob, top_k_pos = image_token_logits.sigmoid().topk(max(k_range), dim=-1, largest=True, sorted=True)
 
     top_k_acc = {}
     top_k_mean_prob = {}
 
+    bs = perturbed_indices.shape[0]
+    batch_indices = torch.arange(bs, device=perturbed_indices.device).unsqueeze(1)
     for k in k_range:
         current_top_k_pos = top_k_pos[:, :k]
 
         # Use advanced indexing instead of torch.gather for better readability.
-        bs = perturbed_indices.shape[0]
-        batch_indices = torch.arange(bs, device=perturbed_indices.device).unsqueeze(1)
         ground_truth_at_top_k = perturbed_indices[batch_indices, current_top_k_pos]
         
-        top_k_acc[k] = ground_truth_at_top_k.float().mean()
+        top_k_acc[k] = ground_truth_at_top_k.float().mean() # (tp) / (tp + tn + fp + fn)
         top_k_mean_prob[k] = top_k_prob[:, :k].mean()
+
+    # compute more meaningful metrics
+    tp_rate = (perturbed_indices[pred_pos] == 1).float().sum() / (pred_pos).float().sum() # True positive rate, real positive / total predicted positive
+    fp_rate = (perturbed_indices[pred_pos] == 0).float().sum() / (pred_pos).float().sum() # False positive rate, real negative / total predicted positive
+    fn_rate = (perturbed_indices[~pred_pos] == 1).float().sum() / (~pred_pos).float().sum() # False negative rate, real positive / total predicted negative
+    tn_rate = (perturbed_indices[~pred_pos] == 0).float().sum() / (~pred_pos).float().sum() # True negative rate, real negative / total predicted negative
     
     # compute pos_weight for the loss function
     pos_ratio = perturbed_indices.float().mean()
@@ -397,7 +404,8 @@ def compute_loss(logits, perturbed_indices):
                                               perturbed_indices.float(),
                                               pos_weight=pos_weight), \
                                               acc, f1, \
-                                              top_k_acc, top_k_mean_prob
+                                              top_k_acc, top_k_mean_prob, \
+                                              tp_rate, fp_rate, fn_rate, tn_rate
 
 def main(args):
     assert torch.cuda.is_available(), "Training currently requires at least one GPU."
@@ -605,7 +613,7 @@ def main(args):
 
             # 3. Forward pass through corrector
             logits = corrector(hidden_states)
-            loss, acc, f1, top_k_acc, top_k_mean_prob = compute_loss(logits, perturbed_indices)
+            loss, acc, f1, top_k_acc, top_k_mean_prob, tp_rate, fp_rate, fn_rate, tn_rate = compute_loss(logits, perturbed_indices)
             
             # 5. Backward pass
             accelerator.backward(loss)
@@ -642,6 +650,10 @@ def main(args):
                                  "top_5_mean_prob": top_k_mean_prob[5],
                                  "top_10_mean_prob": top_k_mean_prob[10],
                                  "top_15_mean_prob": top_k_mean_prob[15],
+                                 "tp_rate": tp_rate.item(),
+                                 "fp_rate": fp_rate.item(),
+                                 "fn_rate": fn_rate.item(),
+                                 "tn_rate": tn_rate.item(),
                                  "lr": lr_scheduler.get_last_lr()[0], 
                                  "time": average_time}, step=train_steps)
                 
