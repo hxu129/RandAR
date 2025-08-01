@@ -127,6 +127,7 @@ def perturb_image_tokens_adversarial(
         for layer in gpt_model.layers:
             h = layer(h, freqs_cis, start_pos=None, mask=None)
 
+
         h = gpt_model.norm(h)
         logits = gpt_model.output(h).float()
         # --- End of forward pass ---
@@ -168,6 +169,15 @@ def perturb_image_tokens_adversarial(
             # Update collision mask for the next check.
             collision_mask = (perturbed_image_tokens == image_tokens) & perturbed_indices
             attempts += 1
+
+        # 5. Shuffle the perturbed sequence and recompute labels.
+        bs, seq_len = perturbed_image_tokens.shape
+        for i in range(bs):
+            shuffle_order = torch.randperm(seq_len, device=perturbed_image_tokens.device)
+            original_shuffled = image_tokens[i][shuffle_order]
+            perturbed_image_tokens[i] = perturbed_image_tokens[i][shuffle_order]
+            # Recompute which positions are perturbed after shuffling
+            perturbed_indices[i] = (perturbed_image_tokens[i] != original_shuffled)
 
     return perturbed_image_tokens, perturbed_indices
 
