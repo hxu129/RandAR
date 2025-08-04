@@ -28,6 +28,7 @@ import argparse
 import sys
 sys.path.append("./")
 import shutil
+import wandb
 
 from omegaconf import OmegaConf
 from omegaconf.listconfig import ListConfig
@@ -43,11 +44,14 @@ from RandAR.model.utils import interleave_tokens
 from RandAR.model.randar_gpt import RandARTransformer
 
 import debugpy
+import os
 
-# debugpy.listen(65432)
-# print("Waiting for debugger to attach...")
-# debugpy.wait_for_client()
-# print("Debugger attached")
+# Only start debugpy in the main process to avoid port conflicts
+# if int(os.environ.get('LOCAL_RANK', 0)) == 0:
+#     debugpy.listen(65432)
+#     print("Waiting for debugger to attach...")
+#     debugpy.wait_for_client()
+#     print("Debugger attached")
 
 def cycle(dl: torch.utils.data.DataLoader):
     while True:
@@ -485,23 +489,29 @@ def check_randar_prediction_quality(
                 'perturbed_gt_prob_std': torch.tensor(0.0, device=device),
                 'perturbed_high_confidence_ratio': torch.tensor(0.0, device=device),
                 'perturbed_count': torch.tensor(0, device=device),
-                'perturbed_rank': torch.tensor(0, device=device),
+                'rank_per_position': torch.zeros(seq_len, device=device),
+                'position_axis': torch.arange(seq_len, device=device),
             }
         else:
             # 提取扰动位置的预测概率
             perturbed_gt_probs = gt_probs[perturbed_mask]
 
-            # get perturbed rank
-            perturbed_rank = (probs > gt_probs.unsqueeze(-1)) # [bs, seq_len, vocab_size]
-            perturbed_rank = perturbed_rank.sum(dim=-1) # [bs, seq_len]
-            perturbed_rank = perturbed_rank[perturbed_mask].float().mean()
+            # Calculate the rank of the ground truth token at each position.
+            # The rank is the number of other tokens with a higher probability.
+            ranks = (probs > gt_probs.unsqueeze(-1)).sum(dim=-1).float()  # Shape: [bs, seq_len]
+
+            rank_per_position = ranks.float().mean(0)
+
+            # Create x-axis for plotting (positions 0 to seq_len-1)
+            position_axis = torch.arange(seq_len, device=device)
 
             metrics = {
                 'perturbed_gt_prob_mean': perturbed_gt_probs.mean(),
                 'perturbed_gt_prob_std': perturbed_gt_probs.std(),
                 'perturbed_high_confidence_ratio': (perturbed_gt_probs > threshold).float().mean(),
                 'perturbed_count': perturbed_mask.sum(),
-                'perturbed_rank': perturbed_rank,
+                'rank_per_position': rank_per_position,
+                'position_axis': position_axis,
             }
         
         # 3. 记录详细信息
@@ -670,6 +680,10 @@ def main(args):
             project_name=args.wandb_project,
             init_kwargs={"wandb": wandb_config},
         )
+        
+        # Define wandb metrics after initialization
+        wandb.define_metric("perturbed_rank_x_axis")
+        wandb.define_metric("perturbed_rank", step_metric="perturbed_rank_x_axis")
 
     #################### Training Loop ####################
     corrector.train()
@@ -677,6 +691,10 @@ def main(args):
     log_iters, running_loss, start_time = 0, 0, time.time()
     block_size = config.corrector_model.params.block_size
     cls_token_num = config.corrector_model.params.cls_token_num
+
+    # Variables for running average of rank per position
+    running_rank_sum = torch.zeros(block_size, device=accelerator.device)
+    running_rank_count = 0
 
     logger.info(f"Starting training from iteration {train_steps} to {total_iters}")
     while train_steps < total_iters:
@@ -710,12 +728,7 @@ def main(args):
             # Handle different return formats
             prediction_quality = None
             if config.training_params.supervision_mode == "adversarial":
-                if len(result) == 3:
-                    perturbed_tokens, perturbed_indices, prediction_quality = result
-                elif len(result) == 5: # For backward compatibility
-                    perturbed_tokens, perturbed_indices, _, _, prediction_quality = result
-                else: # Fallback for older versions
-                    perturbed_tokens, perturbed_indices = result
+                perturbed_tokens, perturbed_indices, prediction_quality = result
             else:
                 # Standard format (replacement mode)
                 perturbed_tokens, perturbed_indices = result
@@ -782,18 +795,38 @@ def main(args):
                 
                 # Add RandAR prediction quality metrics if available
                 if prediction_quality is not None:
+                    # Log standard metrics
                     for key, value in prediction_quality.items():
-                        if torch.is_tensor(value):
-                            log_metrics[f"randar_perturbed/{key}"] = value.item()
-                        else:
-                            log_metrics[f"randar_perturbed/{key}"] = value
+                        if key not in ['rank_per_position', 'position_axis']:
+                            log_metrics[f"randar_perturbed/{key}"] = value.item() if torch.is_tensor(value) and value.dim() == 0 else value
+
+                    # Update and log the running average of rank per position
+                    if 'rank_per_position' in prediction_quality:
+                        # Update running totals
+                        running_rank_sum += prediction_quality['rank_per_position']
+                        running_rank_count += 1
+                        
+                        # Calculate the current running average
+                        cumulative_avg_rank = running_rank_sum / running_rank_count
+                        
+                        # Prepare data for wandb plot
+                        position_data = prediction_quality['position_axis'].cpu().numpy()
+                        rank_data = cumulative_avg_rank.cpu().numpy()
+                        
+                        table_data = [[pos, rank] for pos, rank in zip(position_data, rank_data)]
+                        table = wandb.Table(data=table_data, columns=["Position", "Average Rank"])
+                        log_metrics["randar_perturbed/cumulative_rank_per_position"] = wandb.plot.bar(
+                            table, "Position", "Average Rank", title="Cumulative Average Rank per Position"
+                        )
                     
                     # Additional detailed logging every few steps
                     if train_steps % (args.log_every * 5) == 0:
                         logger.info(f"RandAR Perturbed - Count: {prediction_quality['perturbed_count']}")
                         logger.info(f"RandAR Perturbed - GT Prob: {prediction_quality['perturbed_gt_prob_mean']:.4f}±{prediction_quality['perturbed_gt_prob_std']:.4f}")
                         logger.info(f"RandAR Perturbed - High Confidence: {prediction_quality['perturbed_high_confidence_ratio']:.4f}")
-                        logger.info(f"RandAR Perturbed - Rank: {prediction_quality['perturbed_rank']:.4f}")
+                        if 'rank_per_position' in prediction_quality:
+                            rank_tensor = prediction_quality['rank_per_position']
+                            logger.info(f"RandAR Perturbed - Rank Distribution: mean={rank_tensor.mean():.4f}, std={rank_tensor.std():.4f}")
                 
                 accelerator.log(log_metrics, step=train_steps)
                 
