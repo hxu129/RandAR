@@ -107,8 +107,10 @@ def perturb_image_tokens_adversarial(
             'perturbed_gt_prob_std': torch.tensor(0.0, device=device),
             'perturbed_high_confidence_ratio': torch.tensor(0.0, device=device),
             'perturbed_count': torch.tensor(0, device=device),
+            'perturbed_rank': torch.tensor(0.0, device=device),
         }
-        return perturbed_image_tokens, perturbed_indices, dummy_quality
+        # Return original token_order since no shuffling happened
+        return perturbed_image_tokens, perturbed_indices, dummy_quality, token_order
 
     # 2. Perform a single forward pass with the RandAR model to get all logits.
     with torch.no_grad():
@@ -197,15 +199,18 @@ def perturb_image_tokens_adversarial(
 
         # 5. Shuffle the perturbed sequence and recompute labels.
         bs, seq_len = perturbed_image_tokens.shape
+        new_token_order = token_order.clone()
         for i in range(bs):
             shuffle_order = torch.randperm(seq_len, device=perturbed_image_tokens.device)
             original_shuffled = image_tokens[i][shuffle_order]
             perturbed_image_tokens[i] = perturbed_image_tokens[i][shuffle_order]
+            # Also shuffle the token_order to keep it consistent
+            new_token_order[i] = token_order[i][shuffle_order]
             # Recompute which positions are perturbed after shuffling
             perturbed_indices[i] = (perturbed_image_tokens[i] != original_shuffled)
 
-    # Return only the necessary items for the training loop
-    return perturbed_image_tokens, perturbed_indices, prediction_quality
+    # Return the new token order as well
+    return perturbed_image_tokens, perturbed_indices, prediction_quality, new_token_order
 
 def perturb_image_tokens_replacement(image_tokens, vocab_size, perturb_mode="ratio", perturb_ratio=None, perturb_num=None):
     '''Train the corrector to tell the replacement tokens and the original tokens apart.
@@ -310,9 +315,12 @@ def perturb_image_tokens(image_tokens, vocab_size, supervision_mode="adversarial
         class_tokens: [bsz] class tokens (required for adversarial mode)
     '''
     if supervision_mode == "adversarial":
+        # This function will now consistently return 4 items
         return perturb_image_tokens_adversarial(image_tokens, vocab_size, perturb_mode, perturb_ratio, perturb_num, ar_model, token_order, class_tokens)
     elif supervision_mode == "replacement":
-        return perturb_image_tokens_replacement(image_tokens, vocab_size, perturb_mode, perturb_ratio, perturb_num)
+        perturbed_tokens, perturbed_indices = perturb_image_tokens_replacement(image_tokens, vocab_size, perturb_mode, perturb_ratio, perturb_num)
+        # Return a tuple of 4 with None as placeholders for consistency
+        return perturbed_tokens, perturbed_indices, None, token_order
     else:
         raise ValueError(f"Invalid supervision_mode: {supervision_mode}, must be 'adversarial' or 'replacement'")
 
@@ -695,7 +703,7 @@ def main(args):
             
             permuted_image_tokens = torch.gather(image_tokens, 1, token_order)
 
-            result = perturb_image_tokens(
+            perturbed_tokens, perturbed_indices, prediction_quality, new_token_order = perturb_image_tokens(
                 permuted_image_tokens,
                 config.corrector_model.params.vocab_size,
                 supervision_mode=config.training_params.supervision_mode,
@@ -706,19 +714,9 @@ def main(args):
                 token_order=token_order,
                 class_tokens=y # Pass class tokens to the wrapper
             )
-
-            # Handle different return formats
-            prediction_quality = None
-            if config.training_params.supervision_mode == "adversarial":
-                if len(result) == 3:
-                    perturbed_tokens, perturbed_indices, prediction_quality = result
-                elif len(result) == 5: # For backward compatibility
-                    perturbed_tokens, perturbed_indices, _, _, prediction_quality = result
-                else: # Fallback for older versions
-                    perturbed_tokens, perturbed_indices = result
-            else:
-                # Standard format (replacement mode)
-                perturbed_tokens, perturbed_indices = result
+            # Always update token_order. It will be the new shuffled order in adversarial mode,
+            # or the original order in replacement mode.
+            token_order = new_token_order
 
             # 2. Get hidden states from the frozen gpt model
             logits, hidden_states = get_last_n_hidden_states(
