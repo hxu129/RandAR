@@ -9,17 +9,17 @@ else
     MODEL_SIZE_LATTER=xl
 fi
 
-CUDA_VISIBLE_DEVICES=1 torchrun --nproc_per_node=1 $PROJECT_DIR/tools/search_cfg_weights.py \
+CUDA_VISIBLE_DEVICES=3 torchrun --nproc_per_node=1 $PROJECT_DIR/tools/search_cfg_weights.py \
     --config "${PROJECT_DIR}/configs/randar/randar_${MODEL_SIZE_LATTER}_${MODEL_SIZE}_${TOKENIZER}.yaml" \
-    --exp-name $MODEL_NAME-test-pipeline \
+    --exp-name test-cleanfid-100k \
     --gpt-ckpt "${DATA_PATH}/pretrain-weights/randar_${MODEL_SIZE}_${TOKENIZER}_360k_bs_1024_lr_0.0004.safetensors" \
     --vq-ckpt $PROJECT_DIR/tokenizer/${TOKENIZER}/vq_ds16_c2i.pt \
     --per-proc-batch-size 100 \
-    --num-fid-samples-search 10000 \
-    --num-fid-samples-final 50000 \
-    --cfg-scales-interval 0.2 \
-    --cfg-scales-search 2.0,8.0 \
+    --num-fid-samples-search 1 \
+    --num-fid-samples-final 100000 \
+    --cfg-scales-interval 0.1 \
+    --cfg-scales-search 3.4,3.4 \
     --results-path $DATA_PATH/results \
     --ref-path $DATA_PATH/VIRTUAL_imagenet256_labeled.npz \
     --sample-dir $DATA_PATH/evaluation \
-    --num-inference-steps 88
+    --num-inference-steps -1
