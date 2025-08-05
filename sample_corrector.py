@@ -28,10 +28,13 @@ def create_npz_from_sample_folder(sample_dir, num=50_000):
     Builds a single .npz file from a folder of .png samples.
     """
     samples = []
-    for i in tqdm(range(num), desc="Building .npz file from samples"):
-        sample_pil = Image.open(f"{sample_dir}/{i:06d}.png")
-        sample_np = np.asarray(sample_pil).astype(np.uint8)
-        samples.append(sample_np)
+    # change read all the png files in the sample_dir
+    # for i in tqdm(range(num), desc="Building .npz file from samples"):
+    for i in tqdm(os.listdir(sample_dir), desc="Building .npz file from samples"):
+        if i.endswith(".png"):
+            sample_pil = Image.open(f"{sample_dir}/{i}")
+            sample_np = np.asarray(sample_pil).astype(np.uint8)
+            samples.append(sample_np)
     samples = np.stack(samples)
     assert samples.shape == (num, samples.shape[1], samples.shape[2], 3)
     npz_path = f"{sample_dir}.npz"
@@ -143,7 +146,7 @@ def main(args):
 
         for i, sample in enumerate(samples):
             index = i * dist.get_world_size() + rank + total
-            Image.fromarray(sample).save(f"{sample_folder_dir}/{index:06d}.png")
+            Image.fromarray(sample).save(f"{sample_folder_dir}/{c_indices[i]}_{index:06d}.png")
         total += global_batch_size
         cur_iter += 1
         # I use this line to look at the initial images to check the correctness
