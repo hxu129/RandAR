@@ -423,11 +423,14 @@ def compute_loss(logits, perturbed_indices):
 
     top_k_acc = {}
     top_k_mean_prob = {}
+    top_k_pos_idx = {}
+
 
     bs = perturbed_indices.shape[0]
     batch_indices = torch.arange(bs, device=perturbed_indices.device).unsqueeze(1)
     for k in k_range:
         current_top_k_pos = top_k_pos[:, :k]
+        top_k_pos_idx[k] = current_top_k_pos # [bs, k]
 
         # Use advanced indexing instead of torch.gather for better readability.
         ground_truth_at_top_k = perturbed_indices[batch_indices, current_top_k_pos]
@@ -451,8 +454,7 @@ def compute_loss(logits, perturbed_indices):
     return F.binary_cross_entropy_with_logits(image_token_logits,
                                               perturbed_indices.float(),
                                               pos_weight=pos_weight), \
-                                              acc, f1, \
-                                              top_k_acc, top_k_mean_prob, \
+                                              acc, f1, top_k_acc, top_k_mean_prob, top_k_pos_idx, \
                                               tp_rate, fp_rate, fn_rate, tn_rate
 
 def check_randar_prediction_quality(
@@ -704,6 +706,11 @@ def main(args):
     running_rank_sum = torch.zeros(block_size, device=accelerator.device)
     running_rank_count = 0
 
+    # Variables for running average of top-k position indices
+    running_top_k_pos_idx_sum = {k: torch.zeros(block_size, device=torch.device('cpu')) for k in [1, 2, 3, 5, 10, 15]}
+    running_top_k_pos_idx_count = 0
+    running_top_k_pos_idx_mean = {k: torch.zeros(block_size, device=torch.device('cpu')) for k in [1, 2, 3, 5, 10, 15]}
+
     logger.info(f"Starting training from iteration {train_steps} to {total_iters}")
     while train_steps < total_iters:
         x, y, _ = next(data_loader)
@@ -748,7 +755,7 @@ def main(args):
 
             # 3. Forward pass through corrector
             logits = corrector(hidden_states)
-            loss, acc, f1, top_k_acc, top_k_mean_prob, tp_rate, fp_rate, fn_rate, tn_rate = compute_loss(logits, perturbed_indices)
+            loss, acc, f1, top_k_acc, top_k_mean_prob, top_k_pos_idx, tp_rate, fp_rate, fn_rate, tn_rate = compute_loss(logits, perturbed_indices)
             
             # 5. Backward pass
             accelerator.backward(loss)
@@ -795,6 +802,23 @@ def main(args):
                     "lr": lr_scheduler.get_last_lr()[0], 
                     "time": average_time
                 }
+
+                # Log top-k position indices
+                running_top_k_pos_idx_count += 1
+                for k in top_k_pos_idx.keys():
+                    # top_k_pos_idx[k] has shape [bs, k], we flatten it to count occurrences
+                    indices = top_k_pos_idx[k].flatten()
+                    counts = torch.bincount(indices, minlength=block_size) / bs # normalize by batch size
+                    running_top_k_pos_idx_sum[k] += counts.cpu()
+                    
+                    running_top_k_pos_idx_mean[k] = (running_top_k_pos_idx_sum[k] / running_top_k_pos_idx_count).numpy()
+                    
+                    x_axis = range(block_size)
+                    table_data = [[pos, count] for pos, count in zip(x_axis, running_top_k_pos_idx_mean[k])]
+                    table = wandb.Table(data=table_data, columns=["Position", "Average Count"])
+                    log_metrics[f"randar_perturbed/top_k_pos_idx_{k}"] = wandb.plot.bar(
+                        table, "Position", "Average Count", title=f"Top-{k} Position Indices"
+                    )
                 
                 # Add RandAR prediction quality metrics if available
                 if prediction_quality is not None:
@@ -813,7 +837,7 @@ def main(args):
                         cumulative_avg_rank = running_rank_sum / running_rank_count
                         
                         # Prepare data for wandb plot
-                        position_data = prediction_quality['position_axis'].cpu().numpy()
+                        position_data = torch.arange(block_size, device=accelerator.device).cpu().numpy()
                         rank_data = cumulative_avg_rank.cpu().numpy()
                         
                         table_data = [[pos, rank] for pos, rank in zip(position_data, rank_data)]
