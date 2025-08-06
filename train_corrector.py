@@ -327,6 +327,7 @@ def get_last_n_hidden_states(
     token_order: torch.Tensor,
     output_last_n: int,
     device: torch.device,
+    block_size: int,
 ):
     """
     Feeds a sequence through the RandAR model and returns the hidden states
@@ -336,7 +337,7 @@ def get_last_n_hidden_states(
         model: The RandARTransformer model.
         image_tokens: Tensor of shape [bs, seq_len] with **already permuted** image token IDs.
         cond_tokens: Tensor of shape [bs] or [bs, 1] with class token IDs.
-        token_order: The permutation order used for the image_tokens.
+        token_order: The permutation order used for the image_tokens. (full length)
         output_last_n: The number of final layers to return hidden states from.
         device: The torch device to run on.
 
@@ -349,11 +350,11 @@ def get_last_n_hidden_states(
         model.eval()  # Ensure the model is in evaluation mode
 
         bs, seq_len = image_tokens.shape
-        assert seq_len == model.block_size, f"Input sequence length ({seq_len}) must match the model's block_size ({model.block_size})."
+        assert seq_len == block_size, f"Input sequence length ({seq_len}) must match the model's block_size ({model.block_size})."
 
         cond_embeddings = model.cls_embedding(cond_tokens, train=False)[:, :model.cls_token_num]
         token_embeddings = model.tok_embeddings(image_tokens)
-        pos_instruct_tokens = model.get_position_instruction_tokens(token_order)
+        pos_instruct_tokens = model.get_position_instruction_tokens(token_order)[:, :block_size]
 
         h = torch.cat(
             (cond_embeddings, interleave_tokens(pos_instruct_tokens, token_embeddings)),
@@ -364,7 +365,7 @@ def get_last_n_hidden_states(
         model.freqs_cis = model.freqs_cis.to(device)
         # 1. Select freqs for image tokens (excluding class tokens)
         # 2. Permute them according to the token_order
-        token_freqs_cis_ordered = model.freqs_cis[model.cls_token_num:].clone()[token_order]
+        token_freqs_cis_ordered = model.freqs_cis[model.cls_token_num:].clone()[token_order][:, :block_size]
         # 3. Build the full freqs_cis sequence for interleaved input
         freqs_cis = torch.cat(
             (model.freqs_cis[:model.cls_token_num].unsqueeze(0).repeat(bs, 1, 1, 1),
@@ -411,7 +412,7 @@ def compute_loss(logits, perturbed_indices):
 
     # compute top k accuracy: 1, 5, 10, 15
     k_range = [15, 10, 5, 3, 2, 1]
-    top_k_prob, top_k_pos = image_token_logits.sigmoid().topk(max(k_range), dim=-1, largest=True, sorted=True)
+    top_k_prob, top_k_pos = image_token_logits.sigmoid().topk(min(max(k_range), image_token_logits.shape[1]), dim=-1, largest=True, sorted=True)
 
     top_k_acc = {}
     top_k_mean_prob = {}
@@ -715,21 +716,22 @@ def main(args):
     corrector.train()
     total_iters = config.training_params.max_iters
     log_iters, running_loss, start_time = 0, 0, time.time()
-    block_size = config.corrector_model.params.block_size
+    full_block_size = config.corrector_model.params.block_size
     cls_token_num = config.corrector_model.params.cls_token_num
 
     # Variables for running average of rank per position
-    running_rank_sum = torch.zeros(block_size, device=accelerator.device)
+    running_rank_sum = torch.zeros(full_block_size, device=accelerator.device)
     running_rank_count = 0
 
     # Variables for running average of top-k position indices
-    running_top_k_pos_idx_sum = {k: torch.zeros(block_size, device=torch.device('cpu')) for k in [1, 2, 3, 5, 10, 15]}
-    running_top_k_pos_idx_mean = {k: torch.zeros(block_size, device=torch.device('cpu')) for k in [1, 2, 3, 5, 10, 15]}
-    running_pos_count = {pos_type: torch.zeros(block_size, device=torch.device('cpu')) for pos_type in ['tp', 'fn', 'fp', 'tn']}
-    running_pos_count_mean = {pos_type: torch.zeros(block_size, device=torch.device('cpu')) for pos_type in ['tp', 'fn', 'fp', 'tn']}
+    running_top_k_pos_idx_sum = {k: torch.zeros(full_block_size, device=torch.device('cpu')) for k in [1, 2, 3, 5, 10, 15]}
+    running_top_k_pos_idx_mean = {k: torch.zeros(full_block_size, device=torch.device('cpu')) for k in [1, 2, 3, 5, 10, 15]}
+    running_pos_count = {pos_type: torch.zeros(full_block_size, device=torch.device('cpu')) for pos_type in ['tp', 'fn', 'fp', 'tn']}
+    running_pos_count_mean = {pos_type: torch.zeros(full_block_size, device=torch.device('cpu')) for pos_type in ['tp', 'fn', 'fp', 'tn']}
 
     logger.info(f"Starting training from iteration {train_steps} to {total_iters}")
     while train_steps < total_iters:
+        block_size = full_block_size if config.training_params.full_length_mode else int(full_block_size * torch.rand(1).item())
         x, y, _ = next(data_loader)
         x = x.to(accelerator.device, non_blocking=True)
         y = y.to(accelerator.device, non_blocking=True)
@@ -739,9 +741,9 @@ def main(args):
 
         with accelerator.accumulate(corrector):
             # 1. Prepare token sequence
-            token_order = torch.arange(block_size, device=accelerator.device).unsqueeze(0).repeat(bs, 1)
+            token_order = torch.arange(full_block_size, device=accelerator.device).unsqueeze(0).repeat(bs, 1)
             for i in range(bs):
-                token_order[i] = token_order[i][torch.randperm(block_size, device=accelerator.device)]
+                token_order[i] = token_order[i][torch.randperm(full_block_size, device=accelerator.device)]
             
             permuted_image_tokens = torch.gather(image_tokens, 1, token_order)
 
@@ -760,19 +762,25 @@ def main(args):
             # or the original order in replacement mode.
             token_order = new_token_order
 
+            # prepare tokens and token_order to pass in under partial sequence length mode
+            corr_perturbed_tokens = perturbed_tokens[:, :block_size]
+            corr_perturbed_indices = perturbed_indices[:, :block_size]
+            corr_token_order = token_order[:, :block_size]
+            
             # 2. Get hidden states from the frozen gpt model
             logits, hidden_states = get_last_n_hidden_states(
                 gpt,
-                perturbed_tokens,
+                corr_perturbed_tokens,
                 cond,
                 token_order,
                 output_last_n=config.corrector_model.params.num_ar_layers_for_input,
-                device=accelerator.device
+                device=accelerator.device,
+                block_size=block_size
             )
 
             # 3. Forward pass through corrector
             logits = corrector(hidden_states)
-            return_value = compute_loss(logits, perturbed_indices)
+            return_value = compute_loss(logits, corr_perturbed_indices)
             
             # 5. Backward pass
             accelerator.backward(return_value['loss'])
@@ -820,33 +828,34 @@ def main(args):
                     "time": average_time
                 }
 
-                # Log top-k position indices
-                for k in return_value['top_k_pos_idx'].keys():
-                    # top_k_pos_idx[k] has shape [bs, k], we flatten it to count occurrences
-                    indices = return_value['top_k_pos_idx'][k].flatten()
-                    counts = torch.bincount(indices, minlength=block_size) / bs # normalize by batch size
-                    running_top_k_pos_idx_sum[k] += counts.cpu()
+                if config.training_params.full_length_mode:
+                    # Log top-k position indices
+                    for k in return_value['top_k_pos_idx'].keys():
+                        # top_k_pos_idx[k] has shape [bs, k], we flatten it to count occurrences
+                        indices = return_value['top_k_pos_idx'][k].flatten()
+                        counts = torch.bincount(indices, minlength=full_block_size) / bs # normalize by batch size
+                        running_top_k_pos_idx_sum[k] += counts.cpu()
                     
-                    running_top_k_pos_idx_mean[k] = (running_top_k_pos_idx_sum[k] / train_steps).numpy()
+                        running_top_k_pos_idx_mean[k] = (running_top_k_pos_idx_sum[k] / train_steps).numpy()
                     
-                    x_axis = range(block_size)
-                    table_data = [[pos, count] for pos, count in zip(x_axis, running_top_k_pos_idx_mean[k])]
-                    table = wandb.Table(data=table_data, columns=["Position", "Average Count"])
-                    log_metrics[f"randar_perturbed/top_k_pos_idx_{k}"] = wandb.plot.bar(
-                        table, "Position", "Average Count", title=f"Top-{k} Position Indices"
-                    )
+                        x_axis = range(full_block_size)
+                        table_data = [[pos, count] for pos, count in zip(x_axis, running_top_k_pos_idx_mean[k])]
+                        table = wandb.Table(data=table_data, columns=["Position", "Average Count"])
+                        log_metrics[f"randar_perturbed/top_k_pos_idx_{k}"] = wandb.plot.bar(
+                            table, "Position", "Average Count", title=f"Top-{k} Position Indices"
+                        )
                 
-                # log tp, fn, fp, tn position distribution
-                pos_types = ['tp', 'fn', 'fp', 'tn']
-                for pos_type in pos_types:
-                    running_pos_count[pos_type] += return_value[f'{pos_type}_pos'].cpu()
-                    running_pos_count_mean[pos_type] = (running_pos_count[pos_type] / train_steps).cpu().numpy()
+                    # log tp, fn, fp, tn position distribution
+                    pos_types = ['tp', 'fn', 'fp', 'tn']
+                    for pos_type in pos_types:
+                        running_pos_count[pos_type] += return_value[f'{pos_type}_pos'].cpu()
+                        running_pos_count_mean[pos_type] = (running_pos_count[pos_type] / train_steps).cpu().numpy()
 
-                    table_data = [[pos, count] for pos, count in zip(range(block_size), running_pos_count_mean[pos_type])]
-                    table = wandb.Table(data=table_data, columns=["Position", "Average Count"])
-                    log_metrics[f"randar_perturbed/{pos_type}_pos_distribution"] = wandb.plot.bar(
-                        table, "Position", "Average Count", title=f"{pos_type} Position Distribution"
-                    )
+                        table_data = [[pos, count] for pos, count in zip(range(full_block_size), running_pos_count_mean[pos_type])]
+                        table = wandb.Table(data=table_data, columns=["Position", "Average Count"])
+                        log_metrics[f"randar_perturbed/{pos_type}_pos_distribution"] = wandb.plot.bar(
+                            table, "Position", "Average Count", title=f"{pos_type} Position Distribution"
+                        )
 
                 
                 # Add RandAR prediction quality metrics if available
@@ -866,7 +875,7 @@ def main(args):
                         cumulative_avg_rank = running_rank_sum / running_rank_count
                         
                         # Prepare data for wandb plot
-                        position_data = torch.arange(block_size, device=accelerator.device).cpu().numpy()
+                        position_data = torch.arange(full_block_size, device=accelerator.device).cpu().numpy()
                         rank_data = cumulative_avg_rank.cpu().numpy()
                         
                         table_data = [[pos, rank] for pos, rank in zip(position_data, rank_data)]
