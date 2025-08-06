@@ -614,6 +614,51 @@ def main(args):
     # --- Create Corrector Model ---
     corrector = instantiate_from_config(config.corrector_model).to(accelerator.device)
     logger.info(f"Corrector Parameters: {sum(p.numel() for p in corrector.parameters()):,}")
+    
+    ################## Continue from Pre-trained Weights ##################
+    if args.continue_from_weight:
+        if not os.path.exists(args.continue_from_weight):
+            raise FileNotFoundError(f"Continue checkpoint file not found: {args.continue_from_weight}")
+        
+        if accelerator.is_main_process:
+            logger.info(f"Loading pre-trained corrector weights from: {args.continue_from_weight}")
+        
+        # Load the checkpoint state dict
+        if args.continue_from_weight.endswith('.safetensors'):
+            from safetensors.torch import load_file 
+            checkpoint = load_file(args.continue_from_weight)
+        else:
+            # Temporarily patch torch.load to use weights_only=False for trusted checkpoint loading
+            original_load = torch.load
+            def patched_load(*args, **kwargs):
+                if 'weights_only' not in kwargs:
+                    kwargs['weights_only'] = False
+                return original_load(*args, **kwargs)
+            
+            torch.load = patched_load
+            try:
+                checkpoint = torch.load(args.continue_from_weight, map_location=accelerator.device)
+            finally:
+                torch.load = original_load
+        
+        # Extract model state dict if it's wrapped in accelerator checkpoint format
+        if isinstance(checkpoint, dict):
+            if 'model' in checkpoint:
+                # If checkpoint contains model key (from accelerator.save_state)
+                model_state_dict = checkpoint['model']
+            elif any(key.startswith('module.') for key in checkpoint.keys()):
+                # If it's a DataParallel/DistributedDataParallel wrapped model
+                model_state_dict = {k.replace('module.', ''): v for k, v in checkpoint.items()}
+            else:
+                # Assume it's already a clean state dict
+                model_state_dict = checkpoint
+        else:
+            model_state_dict = checkpoint
+        
+        # Load the state dict into the corrector model
+        # Use unwrap to get the actual model if it's wrapped by accelerator
+        unwrapped_model = accelerator.unwrap_model(corrector)
+        unwrapped_model.load_state_dict(model_state_dict, strict=True)
 
     # --- Optimizer and Scheduler ---
     optimizer = torch.optim.AdamW(corrector.parameters(), lr=config.optimizer.lr, weight_decay=config.optimizer.weight_decay, betas=config.optimizer.betas)
@@ -630,6 +675,11 @@ def main(args):
     data_loader = cycle(data_loader)
     
     ################## Resume Training ##################
+    # Ensure only one resume method is used
+    if args.resume_from and args.continue_from_weight:
+        raise ValueError("Cannot use both --resume-from and --continue-from-weight simultaneously. "
+                        "Use --resume-from for full state resumption or --continue-from-weight for weight-only loading.")
+    
     train_steps = 0
     if args.resume_from:
         if not os.path.exists(args.resume_from):
@@ -697,11 +747,14 @@ def main(args):
             if accelerator.is_main_process:
                 logger.info(f"Attempting to resume wandb run with ID: {wandb_config['id']}")
         else:
-            # Fresh training or user chose not to resume wandb - create new run
+            # Fresh training, continuing from weights, or user chose not to resume wandb - create new run
             wandb_config["resume"] = False
             if args.resume_from and not args.resume_wandb:
                 if accelerator.is_main_process:
                     logger.info("Resuming training but creating new wandb run (--resume-wandb not specified)")
+            elif args.continue_from_weight:
+                if accelerator.is_main_process:
+                    logger.info("Starting fresh training from pre-trained weights - creating new wandb run")
             
         accelerator.init_trackers(
             project_name=args.wandb_project,
@@ -825,7 +878,8 @@ def main(args):
                     "fn_rate": return_value['fn_rate'].item(),
                     "tn_rate": return_value['tn_rate'].item(),
                     "lr": lr_scheduler.get_last_lr()[0], 
-                    "time": average_time
+                    "time": average_time,
+                    "block_size": block_size
                 }
 
                 if config.training_params.full_length_mode:
@@ -949,7 +1003,8 @@ if __name__ == "__main__":
     parser.add_argument("--num-workers", type=int, default=8)
 
     # Resume training
-    parser.add_argument("--resume-from", type=str, default=None, help="Path to checkpoint directory to resume from")
+    parser.add_argument("--resume-from", type=str, default=None, help="Path to checkpoint directory to resume from (full state: model, optimizer, scheduler)")
+    parser.add_argument("--continue-from-weight", type=str, default=None, help="Path to checkpoint file to load model weights from (fresh optimizer/scheduler states)")
     parser.add_argument("--resume-wandb", action="store_true", help="Resume wandb logging when resuming from checkpoint")
 
     # Logging and Checkpointing
