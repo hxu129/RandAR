@@ -137,16 +137,8 @@ def perturb_image_tokens_adversarial(
             dim=1
         )
 
-        # Prepare causal mask for the sequence.
-        total_seq_len = h.shape[1]
-        causal_mask = torch.triu(
-            torch.full((total_seq_len, total_seq_len), float('-inf'), device=device),
-            diagonal=1
-        )
-
         for layer in gpt_model.layers:
-            h = layer(h, freqs_cis, start_pos=None, mask=causal_mask)
-
+            h = layer(h, freqs_cis, start_pos=None, mask=None)
 
         h = gpt_model.norm(h)
         logits = gpt_model.output(h).float()
@@ -156,7 +148,7 @@ def perturb_image_tokens_adversarial(
 
         # Select logits for image token positions from the interleaved sequence.
         # Shape: [bs, seq_len, vocab_size]
-        image_token_logits = logits[:, gpt_model.cls_token_num + 1::2, :]
+        image_token_logits = logits[:, gpt_model.cls_token_num::2, :]
 
         # Check RandAR prediction quality BEFORE perturbation
         prediction_quality = check_randar_prediction_quality(
@@ -211,7 +203,7 @@ def perturb_image_tokens_adversarial(
             # Also shuffle the token_order to keep it consistent
             new_token_order[i] = token_order[i][shuffle_order]
             # Recompute which positions are perturbed after shuffling
-            perturbed_indices[i] = (perturbed_image_tokens[i] != original_shuffled)
+            perturbed_indices[i] = perturbed_indices[i][shuffle_order]
 
     # Return the new token order as well
     return perturbed_image_tokens, perturbed_indices, prediction_quality, new_token_order
@@ -443,7 +435,14 @@ def compute_loss(logits, perturbed_indices):
     fp_rate = (perturbed_indices[pred_pos] == 0).float().sum() / (pred_pos).float().sum() # False positive rate, real negative / total predicted positive
     fn_rate = (perturbed_indices[~pred_pos] == 1).float().sum() / (~pred_pos).float().sum() # False negative rate, real positive / total predicted negative
     tn_rate = (perturbed_indices[~pred_pos] == 0).float().sum() / (~pred_pos).float().sum() # True negative rate, real negative / total predicted negative
-    
+
+    # get the position information about fp, fn, tp, tn
+    position_init = torch.arange(image_token_logits.shape[1], device=image_token_logits.device).repeat(bs, 1)
+    fp_pos = position_init[(perturbed_indices == 0) & (pred_pos == 1)].bincount(minlength=image_token_logits.shape[1]) / bs # position distribution of false positive samples
+    fn_pos = position_init[(perturbed_indices == 1) & (pred_pos == 0)].bincount(minlength=image_token_logits.shape[1]) / bs # position distribution of false negative samples
+    tp_pos = position_init[(perturbed_indices == 1) & (pred_pos == 1)].bincount(minlength=image_token_logits.shape[1]) / bs # position distribution of true positive samples
+    tn_pos = position_init[(perturbed_indices == 0) & (pred_pos == 0)].bincount(minlength=image_token_logits.shape[1]) / bs # position distribution of true negative samples
+
     # compute pos_weight for the loss function
     pos_ratio = perturbed_indices.float().mean()
     neg_ratio = 1 - pos_ratio
@@ -451,11 +450,28 @@ def compute_loss(logits, perturbed_indices):
     
     # Target (perturbed_indices) also has shape [bs, block_size]
     # It needs to be converted to float for the loss function
-    return F.binary_cross_entropy_with_logits(image_token_logits,
+    loss = F.binary_cross_entropy_with_logits(image_token_logits,
                                               perturbed_indices.float(),
-                                              pos_weight=pos_weight), \
-                                              acc, f1, top_k_acc, top_k_mean_prob, top_k_pos_idx, \
-                                              tp_rate, fp_rate, fn_rate, tn_rate
+                                              pos_weight=pos_weight)
+
+    return_value = {
+        'loss': loss,
+        'acc': acc,
+        'f1': f1,
+        'top_k_acc': top_k_acc,
+        'top_k_mean_prob': top_k_mean_prob,
+        'top_k_pos_idx': top_k_pos_idx,
+        'tp_pos': tp_pos,
+        'fn_pos': fn_pos,
+        'fp_pos': fp_pos,
+        'tn_pos': tn_pos,
+        'tp_rate': tp_rate,
+        'fp_rate': fp_rate,
+        'fn_rate': fn_rate,
+        'tn_rate': tn_rate,
+    }
+    
+    return return_value
 
 def check_randar_prediction_quality(
     logits: torch.Tensor,
@@ -708,8 +724,9 @@ def main(args):
 
     # Variables for running average of top-k position indices
     running_top_k_pos_idx_sum = {k: torch.zeros(block_size, device=torch.device('cpu')) for k in [1, 2, 3, 5, 10, 15]}
-    running_top_k_pos_idx_count = 0
     running_top_k_pos_idx_mean = {k: torch.zeros(block_size, device=torch.device('cpu')) for k in [1, 2, 3, 5, 10, 15]}
+    running_pos_count = {pos_type: torch.zeros(block_size, device=torch.device('cpu')) for pos_type in ['tp', 'fn', 'fp', 'tn']}
+    running_pos_count_mean = {pos_type: torch.zeros(block_size, device=torch.device('cpu')) for pos_type in ['tp', 'fn', 'fp', 'tn']}
 
     logger.info(f"Starting training from iteration {train_steps} to {total_iters}")
     while train_steps < total_iters:
@@ -755,10 +772,10 @@ def main(args):
 
             # 3. Forward pass through corrector
             logits = corrector(hidden_states)
-            loss, acc, f1, top_k_acc, top_k_mean_prob, top_k_pos_idx, tp_rate, fp_rate, fn_rate, tn_rate = compute_loss(logits, perturbed_indices)
+            return_value = compute_loss(logits, perturbed_indices)
             
             # 5. Backward pass
-            accelerator.backward(loss)
+            accelerator.backward(return_value['loss'])
             if config.optimizer.max_grad_norm > 0:
                 accelerator.clip_grad_norm_(corrector.parameters(), config.optimizer.max_grad_norm)
             
@@ -766,7 +783,7 @@ def main(args):
             lr_scheduler.step()
             optimizer.zero_grad()
 
-            running_loss += accelerator.gather(loss.repeat(per_gpu_batch_size)).mean().item() / config.accelerator.gradient_accumulation_steps
+            running_loss += accelerator.gather(return_value['loss'].repeat(per_gpu_batch_size)).mean().item() / config.accelerator.gradient_accumulation_steps
 
         if accelerator.sync_gradients:
             train_steps += 1
@@ -776,42 +793,41 @@ def main(args):
                 end_time = time.time()
                 average_time = (end_time - start_time) / args.log_every
 
-                logger.info(f"Step {train_steps:08d} | Loss {average_loss:.4f} | Acc {acc:.4f} | F1 {f1:.4f} | Time {average_time:.4f}s | LR {lr_scheduler.get_last_lr()[0]:.6f}")
+                logger.info(f"Step {train_steps:08d} | Loss {average_loss:.4f} | Acc {return_value['acc']:.4f} | F1 {return_value['f1']:.4f} | Time {average_time:.4f}s | LR {lr_scheduler.get_last_lr()[0]:.6f}")
                 
                 # Prepare logging metrics
                 log_metrics = {
                     "loss": average_loss, 
-                    "acc": acc, 
-                    "f1": f1, 
-                    "top_1_acc": top_k_acc[1],
-                    "top_2_acc": top_k_acc[2],
-                    "top_3_acc": top_k_acc[3],
-                    "top_5_acc": top_k_acc[5],
-                    "top_10_acc": top_k_acc[10],
-                    "top_15_acc": top_k_acc[15],
-                    "top_1_mean_prob": top_k_mean_prob[1],
-                    "top_2_mean_prob": top_k_mean_prob[2],
-                    "top_3_mean_prob": top_k_mean_prob[3],
-                    "top_5_mean_prob": top_k_mean_prob[5],
-                    "top_10_mean_prob": top_k_mean_prob[10],
-                    "top_15_mean_prob": top_k_mean_prob[15],
-                    "tp_rate": tp_rate.item(),
-                    "fp_rate": fp_rate.item(),
-                    "fn_rate": fn_rate.item(),
-                    "tn_rate": tn_rate.item(),
+                    "acc": return_value['acc'], 
+                    "f1": return_value['f1'], 
+                    "top_1_acc": return_value['top_k_acc'][1],
+                    "top_2_acc": return_value['top_k_acc'][2],
+                    "top_3_acc": return_value['top_k_acc'][3],
+                    "top_5_acc": return_value['top_k_acc'][5],
+                    "top_10_acc": return_value['top_k_acc'][10],
+                    "top_15_acc": return_value['top_k_acc'][15],
+                    "top_1_mean_prob": return_value['top_k_mean_prob'][1],
+                    "top_2_mean_prob": return_value['top_k_mean_prob'][2],
+                    "top_3_mean_prob": return_value['top_k_mean_prob'][3],
+                    "top_5_mean_prob": return_value['top_k_mean_prob'][5],
+                    "top_10_mean_prob": return_value['top_k_mean_prob'][10],
+                    "top_15_mean_prob": return_value['top_k_mean_prob'][15],
+                    "tp_rate": return_value['tp_rate'].item(),
+                    "fp_rate": return_value['fp_rate'].item(),
+                    "fn_rate": return_value['fn_rate'].item(),
+                    "tn_rate": return_value['tn_rate'].item(),
                     "lr": lr_scheduler.get_last_lr()[0], 
                     "time": average_time
                 }
 
                 # Log top-k position indices
-                running_top_k_pos_idx_count += 1
-                for k in top_k_pos_idx.keys():
+                for k in return_value['top_k_pos_idx'].keys():
                     # top_k_pos_idx[k] has shape [bs, k], we flatten it to count occurrences
-                    indices = top_k_pos_idx[k].flatten()
+                    indices = return_value['top_k_pos_idx'][k].flatten()
                     counts = torch.bincount(indices, minlength=block_size) / bs # normalize by batch size
                     running_top_k_pos_idx_sum[k] += counts.cpu()
                     
-                    running_top_k_pos_idx_mean[k] = (running_top_k_pos_idx_sum[k] / running_top_k_pos_idx_count).numpy()
+                    running_top_k_pos_idx_mean[k] = (running_top_k_pos_idx_sum[k] / train_steps).numpy()
                     
                     x_axis = range(block_size)
                     table_data = [[pos, count] for pos, count in zip(x_axis, running_top_k_pos_idx_mean[k])]
@@ -819,6 +835,19 @@ def main(args):
                     log_metrics[f"randar_perturbed/top_k_pos_idx_{k}"] = wandb.plot.bar(
                         table, "Position", "Average Count", title=f"Top-{k} Position Indices"
                     )
+                
+                # log tp, fn, fp, tn position distribution
+                pos_types = ['tp', 'fn', 'fp', 'tn']
+                for pos_type in pos_types:
+                    running_pos_count[pos_type] += return_value[f'{pos_type}_pos'].cpu()
+                    running_pos_count_mean[pos_type] = (running_pos_count[pos_type] / train_steps).cpu().numpy()
+
+                    table_data = [[pos, count] for pos, count in zip(range(block_size), running_pos_count_mean[pos_type])]
+                    table = wandb.Table(data=table_data, columns=["Position", "Average Count"])
+                    log_metrics[f"randar_perturbed/{pos_type}_pos_distribution"] = wandb.plot.bar(
+                        table, "Position", "Average Count", title=f"{pos_type} Position Distribution"
+                    )
+
                 
                 # Add RandAR prediction quality metrics if available
                 if prediction_quality is not None:
@@ -845,15 +874,6 @@ def main(args):
                         log_metrics["randar_perturbed/cumulative_rank_per_position"] = wandb.plot.bar(
                             table, "Position", "Average Rank", title="Cumulative Average Rank per Position"
                         )
-                    
-                    # Additional detailed logging every few steps
-                    if train_steps % (args.log_every * 5) == 0:
-                        logger.info(f"RandAR Perturbed - Count: {prediction_quality['perturbed_count']}")
-                        logger.info(f"RandAR Perturbed - GT Prob: {prediction_quality['perturbed_gt_prob_mean']:.4f}±{prediction_quality['perturbed_gt_prob_std']:.4f}")
-                        logger.info(f"RandAR Perturbed - High Confidence: {prediction_quality['perturbed_high_confidence_ratio']:.4f}")
-                        if 'rank_per_position' in prediction_quality:
-                            rank_tensor = prediction_quality['rank_per_position']
-                            logger.info(f"RandAR Perturbed - Rank Distribution: mean={rank_tensor.mean():.4f}, std={rank_tensor.std():.4f}")
                 
                 accelerator.log(log_metrics, step=train_steps)
                 

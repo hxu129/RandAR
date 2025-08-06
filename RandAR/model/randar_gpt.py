@@ -830,8 +830,8 @@ class RandARTransformer(nn.Module):
                     _, hidden_states = self._forward_no_cache(corr_x, corr_freqs_cis, output_last_n=corrector_num_ar_layers)
             
                     # Step 6-2: Run the corrector
-                    corr_logits = corrector(hidden_states)
-                    corr_logits = corr_logits.squeeze(-1)[:, self.cls_token_num::2]
+                    corr_logits = corrector(hidden_states) # TODO: double check the shape of the tensor
+                    corr_logits = corr_logits.squeeze(-1)[:, self.cls_token_num + 1::2] # TODO: double check the indexing
 
                     # Step 6-3: Select tokens to correct
                     # Sort indices by error score in descending order (most likely error first)
