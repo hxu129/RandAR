@@ -784,7 +784,9 @@ def main(args):
 
     logger.info(f"Starting training from iteration {train_steps} to {total_iters}")
     while train_steps < total_iters:
-        block_size = full_block_size if config.training_params.full_length_mode else int(full_block_size * torch.rand(1).item())
+        block_size = full_block_size if config.training_params.full_length_mode else torch.randint(128, 201, (1,)).item()
+        if train_steps % 100 == 0:
+            block_size = full_block_size
         x, y, _ = next(data_loader)
         x = x.to(accelerator.device, non_blocking=True)
         y = y.to(accelerator.device, non_blocking=True)
@@ -818,7 +820,6 @@ def main(args):
             # prepare tokens and token_order to pass in under partial sequence length mode
             corr_perturbed_tokens = perturbed_tokens[:, :block_size]
             corr_perturbed_indices = perturbed_indices[:, :block_size]
-            corr_token_order = token_order[:, :block_size]
             
             # 2. Get hidden states from the frozen gpt model
             logits, hidden_states = get_last_n_hidden_states(
@@ -882,7 +883,7 @@ def main(args):
                     "block_size": block_size
                 }
 
-                if config.training_params.full_length_mode:
+                if block_size == full_block_size:
                     # Log top-k position indices
                     for k in return_value['top_k_pos_idx'].keys():
                         # top_k_pos_idx[k] has shape [bs, k], we flatten it to count occurrences
@@ -890,26 +891,22 @@ def main(args):
                         counts = torch.bincount(indices, minlength=full_block_size) / bs # normalize by batch size
                         running_top_k_pos_idx_sum[k] += counts.cpu()
                     
-                        running_top_k_pos_idx_mean[k] = (running_top_k_pos_idx_sum[k] / train_steps).numpy()
+                        running_top_k_pos_idx_mean[k] = (running_top_k_pos_idx_sum[k] / (train_steps % 100)).numpy()
                     
                         x_axis = range(full_block_size)
                         table_data = [[pos, count] for pos, count in zip(x_axis, running_top_k_pos_idx_mean[k])]
                         table = wandb.Table(data=table_data, columns=["Position", "Average Count"])
-                        log_metrics[f"randar_perturbed/top_k_pos_idx_{k}"] = wandb.plot.bar(
-                            table, "Position", "Average Count", title=f"Top-{k} Position Indices"
-                        )
+                        log_metrics[f"randar_perturbed/top_k_pos_idx_{k}"] = table
                 
                     # log tp, fn, fp, tn position distribution
                     pos_types = ['tp', 'fn', 'fp', 'tn']
                     for pos_type in pos_types:
                         running_pos_count[pos_type] += return_value[f'{pos_type}_pos'].cpu()
-                        running_pos_count_mean[pos_type] = (running_pos_count[pos_type] / train_steps).cpu().numpy()
+                        running_pos_count_mean[pos_type] = (running_pos_count[pos_type] / train_steps % 100).cpu().numpy()
 
                         table_data = [[pos, count] for pos, count in zip(range(full_block_size), running_pos_count_mean[pos_type])]
                         table = wandb.Table(data=table_data, columns=["Position", "Average Count"])
-                        log_metrics[f"randar_perturbed/{pos_type}_pos_distribution"] = wandb.plot.bar(
-                            table, "Position", "Average Count", title=f"{pos_type} Position Distribution"
-                        )
+                        log_metrics[f"randar_perturbed/{pos_type}_pos_distribution"] = table
 
                 
                 # Add RandAR prediction quality metrics if available
