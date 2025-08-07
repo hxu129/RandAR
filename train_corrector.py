@@ -73,15 +73,24 @@ def perturb_image_tokens_adversarial(
     
     Args:
         gpt_model: Pre-trained, frozen RandAR model.
-        image_tokens: [bs, seq_len] image tokens, already permuted by token_order.
+        image_tokens: [bs, seq_len] image tokens, already permuted and cropped.
         cond_tokens: [bs] Class condition tokens.
-        token_order: [bs, seq_len] The permutation order used for image_tokens.
+        token_order: [bs, seq_len] The permutation order used for image_tokens (already cropped).
         perturb_ratio: float, ratio of tokens to perturb (used in "ratio" mode).
         perturb_num: int, number of tokens to perturb (used in "num" mode).
         perturb_mode: str, perturbation mode ("ratio" or "num").
     """
     bs, seq_len = image_tokens.shape
     device = image_tokens.device
+    
+    # 扩展token_order到完整长度用于RoPE计算
+    full_block_size = gpt_model.block_size
+    if seq_len < full_block_size:
+        # 添加剩余的位置索引 [seq_len, seq_len+1, ..., full_block_size-1]
+        remaining_positions = torch.arange(seq_len, full_block_size, device=device).unsqueeze(0).repeat(bs, 1)
+        extended_token_order = torch.cat([token_order, remaining_positions], dim=1)
+    else:
+        extended_token_order = token_order
 
     # 1. Determine positions to perturb and create a boolean mask.
     if perturb_mode == "ratio":
@@ -122,7 +131,9 @@ def perturb_image_tokens_adversarial(
 
         cond_embeddings = gpt_model.cls_embedding(cond_tokens, train=False)[:, :gpt_model.cls_token_num]
         token_embeddings = gpt_model.tok_embeddings(image_tokens)
-        pos_instruct_tokens = gpt_model.get_position_instruction_tokens(token_order)
+        # 使用扩展的token_order计算位置编码，然后裁剪到实际长度
+        pos_instruct_tokens_full = gpt_model.get_position_instruction_tokens(extended_token_order)
+        pos_instruct_tokens = pos_instruct_tokens_full[:, :seq_len]
 
         h = torch.cat(
             (cond_embeddings, interleave_tokens(pos_instruct_tokens, token_embeddings)),
@@ -130,7 +141,9 @@ def perturb_image_tokens_adversarial(
         )
 
         gpt_model.freqs_cis = gpt_model.freqs_cis.to(device)
-        token_freqs_cis_ordered = gpt_model.freqs_cis[gpt_model.cls_token_num:].clone()[token_order]
+        # 使用扩展的token_order计算频率，然后裁剪
+        token_freqs_cis_ordered_full = gpt_model.freqs_cis[gpt_model.cls_token_num:].clone()[extended_token_order]
+        token_freqs_cis_ordered = token_freqs_cis_ordered_full[:, :seq_len]
         freqs_cis = torch.cat(
             (gpt_model.freqs_cis[:gpt_model.cls_token_num].unsqueeze(0).repeat(bs, 1, 1, 1),
              interleave_tokens(token_freqs_cis_ordered, token_freqs_cis_ordered)),
@@ -335,11 +348,12 @@ def get_last_n_hidden_states(
 
     Args:
         model: The RandARTransformer model.
-        image_tokens: Tensor of shape [bs, seq_len] with **already permuted** image token IDs.
+        image_tokens: Tensor of shape [bs, seq_len] with **already permuted and cropped** image token IDs.
         cond_tokens: Tensor of shape [bs] or [bs, 1] with class token IDs.
-        token_order: The permutation order used for the image_tokens. (full length)
+        token_order: The permutation order used for the image_tokens (already cropped).
         output_last_n: The number of final layers to return hidden states from.
         device: The torch device to run on.
+        block_size: The actual sequence length being processed.
 
     Returns:
         A tuple of (logits, hidden_states).
@@ -350,11 +364,22 @@ def get_last_n_hidden_states(
         model.eval()  # Ensure the model is in evaluation mode
 
         bs, seq_len = image_tokens.shape
-        assert seq_len == block_size, f"Input sequence length ({seq_len}) must match the model's block_size ({model.block_size})."
+        assert seq_len == block_size, f"Input sequence length ({seq_len}) must match block_size ({block_size})."
+        
+        # 扩展token_order到完整长度用于RoPE计算
+        full_block_size = model.block_size
+        if seq_len < full_block_size:
+            # 添加剩余的位置索引 [seq_len, seq_len+1, ..., full_block_size-1]
+            remaining_positions = torch.arange(seq_len, full_block_size, device=device).unsqueeze(0).repeat(bs, 1)
+            extended_token_order = torch.cat([token_order, remaining_positions], dim=1)
+        else:
+            extended_token_order = token_order
 
         cond_embeddings = model.cls_embedding(cond_tokens, train=False)[:, :model.cls_token_num]
         token_embeddings = model.tok_embeddings(image_tokens)
-        pos_instruct_tokens = model.get_position_instruction_tokens(token_order)[:, :block_size]
+        # 使用扩展的token_order计算位置编码，然后裁剪到实际长度
+        pos_instruct_tokens_full = model.get_position_instruction_tokens(extended_token_order)
+        pos_instruct_tokens = pos_instruct_tokens_full[:, :seq_len]
 
         h = torch.cat(
             (cond_embeddings, interleave_tokens(pos_instruct_tokens, token_embeddings)),
@@ -363,10 +388,9 @@ def get_last_n_hidden_states(
 
         # Correctly prepare RoPE embeddings for the sequence
         model.freqs_cis = model.freqs_cis.to(device)
-        # 1. Select freqs for image tokens (excluding class tokens)
-        # 2. Permute them according to the token_order
-        token_freqs_cis_ordered = model.freqs_cis[model.cls_token_num:].clone()[token_order][:, :block_size]
-        # 3. Build the full freqs_cis sequence for interleaved input
+        # 使用扩展的token_order计算频率，然后裁剪
+        token_freqs_cis_ordered_full = model.freqs_cis[model.cls_token_num:].clone()[extended_token_order]
+        token_freqs_cis_ordered = token_freqs_cis_ordered_full[:, :seq_len]
         freqs_cis = torch.cat(
             (model.freqs_cis[:model.cls_token_num].unsqueeze(0).repeat(bs, 1, 1, 1),
              interleave_tokens(token_freqs_cis_ordered, token_freqs_cis_ordered)),
@@ -802,24 +826,30 @@ def main(args):
             
             permuted_image_tokens = torch.gather(image_tokens, 1, token_order)
 
+            # Crop first, then perturb
+            cropped_permuted_tokens = permuted_image_tokens[:, :block_size]
+            cropped_token_order = token_order[:, :block_size]
+
             perturbed_tokens, perturbed_indices, prediction_quality, new_token_order = perturb_image_tokens(
-                permuted_image_tokens,
+                cropped_permuted_tokens,
                 config.corrector_model.params.vocab_size,
                 supervision_mode=config.training_params.supervision_mode,
                 perturb_mode=config.training_params.perturb_mode,
                 perturb_ratio=config.training_params.perturb_ratio,
                 perturb_num=config.training_params.perturb_num,
                 ar_model=gpt,
-                token_order=token_order,
+                token_order=cropped_token_order,
                 class_tokens=y # Pass class tokens to the wrapper
             )
             # Always update token_order. It will be the new shuffled order in adversarial mode,
             # or the original order in replacement mode.
             token_order = new_token_order
 
-            # prepare tokens and token_order to pass in under partial sequence length mode
-            corr_perturbed_tokens = perturbed_tokens[:, :block_size]
-            corr_perturbed_indices = perturbed_indices[:, :block_size]
+            # 扰动后的序列已经是正确长度，直接使用
+            corr_perturbed_tokens = perturbed_tokens
+            corr_perturbed_indices = perturbed_indices
+            
+            
             
             # 2. Get hidden states from the frozen gpt model
             logits, hidden_states = get_last_n_hidden_states(
@@ -916,8 +946,8 @@ def main(args):
                         if key not in ['rank_per_position', 'position_axis']:
                             log_metrics[f"randar_perturbed/{key}"] = value.item() if torch.is_tensor(value) and value.dim() == 0 else value
 
-                    # Update and log the running average of rank per position
-                    if 'rank_per_position' in prediction_quality:
+                    # Update and log the running average of rank per position only for full block size
+                    if 'rank_per_position' in prediction_quality and block_size == full_block_size:
                         # Update running totals
                         running_rank_sum += prediction_quality['rank_per_position']
                         running_rank_count += 1
