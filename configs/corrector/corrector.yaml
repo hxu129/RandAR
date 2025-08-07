@@ -31,6 +31,7 @@ corrector_model:
 
 # Training parameters
 training_params:
+  full_length_mode: False
   max_iters: 100000
   global_batch_size: 288
   supervision_mode: "adversarial" # "adversarial" or "replacement"
