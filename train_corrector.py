@@ -28,13 +28,13 @@ import argparse
 import sys
 sys.path.append("./")
 import shutil
-import wandb
 
 from omegaconf import OmegaConf
 from omegaconf.listconfig import ListConfig
 from accelerate import Accelerator, DistributedDataParallelKwargs
 from accelerate.utils import set_seed, ProjectConfiguration
 from accelerate.logging import get_logger
+import wandb
 
 from RandAR.util import instantiate_from_config, load_safetensors
 from RandAR.dataset.builder import build_dataset
@@ -44,14 +44,11 @@ from RandAR.model.utils import interleave_tokens
 from RandAR.model.randar_gpt import RandARTransformer
 
 import debugpy
-import os
 
-# Only start debugpy in the main process to avoid port conflicts
-# if int(os.environ.get('LOCAL_RANK', 0)) == 0:
-#     debugpy.listen(65432)
-#     print("Waiting for debugger to attach...")
-#     debugpy.wait_for_client()
-#     print("Debugger attached")
+# debugpy.listen(65432)
+# print("Waiting for debugger to attach...")
+# debugpy.wait_for_client()
+# print("Debugger attached")
 
 def cycle(dl: torch.utils.data.DataLoader):
     while True:
@@ -111,10 +108,8 @@ def perturb_image_tokens_adversarial(
             'perturbed_gt_prob_std': torch.tensor(0.0, device=device),
             'perturbed_high_confidence_ratio': torch.tensor(0.0, device=device),
             'perturbed_count': torch.tensor(0, device=device),
-            'perturbed_rank': torch.tensor(0.0, device=device),
         }
-        # Return original token_order since no shuffling happened
-        return perturbed_image_tokens, perturbed_indices, dummy_quality, token_order
+        return perturbed_image_tokens, perturbed_indices, dummy_quality
 
     # 2. Perform a single forward pass with the RandAR model to get all logits.
     with torch.no_grad():
@@ -135,6 +130,13 @@ def perturb_image_tokens_adversarial(
             (gpt_model.freqs_cis[:gpt_model.cls_token_num].unsqueeze(0).repeat(bs, 1, 1, 1),
              interleave_tokens(token_freqs_cis_ordered, token_freqs_cis_ordered)),
             dim=1
+        )
+
+        # Prepare causal mask for the sequence.
+        total_seq_len = h.shape[1]
+        causal_mask = torch.triu(
+            torch.full((total_seq_len, total_seq_len), float('-inf'), device=device),
+            diagonal=1
         )
 
         for layer in gpt_model.layers:
@@ -446,9 +448,14 @@ def compute_loss(logits, perturbed_indices):
 
     # compute pos_weight for the loss function
     pos_ratio = perturbed_indices.float().mean()
-    neg_ratio = 1 - pos_ratio
-    pos_weight = neg_ratio / pos_ratio
-    
+    # Avoid division by zero or extreme values if a batch contains nearly all positive or all negative samples.
+    if pos_ratio > 1e-5 and pos_ratio < 1 - 1e-5:
+        neg_ratio = 1 - pos_ratio
+        pos_weight = neg_ratio / pos_ratio
+    else:
+        # Default to 1.0 if pos_ratio is too close to 0 or 1, avoiding extreme weights.
+        pos_weight = torch.tensor(1.0, device=logits.device)
+
     # Target (perturbed_indices) also has shape [bs, block_size]
     # It needs to be converted to float for the loss function
     loss = F.binary_cross_entropy_with_logits(image_token_logits,
@@ -795,44 +802,46 @@ def main(args):
         bs = image_tokens.shape[0]
 
         with accelerator.accumulate(corrector):
-            # 1. Prepare token sequence
+            # 1. Prepare and crop token sequence *before* perturbation
             token_order = torch.arange(full_block_size, device=accelerator.device).unsqueeze(0).repeat(bs, 1)
             for i in range(bs):
                 token_order[i] = token_order[i][torch.randperm(full_block_size, device=accelerator.device)]
             
+            # Crop the token_order to the current block_size *before* gathering tokens
+            cropped_token_order = token_order[:, :block_size]
+            
+            # Gather the full permuted sequence to get the correct tokens for the cropped order
             permuted_image_tokens = torch.gather(image_tokens, 1, token_order)
+            # Now, select the tokens corresponding to the cropped sequence
+            corr_image_tokens = permuted_image_tokens[:, :block_size]
 
-            perturbed_tokens, perturbed_indices, prediction_quality, new_token_order = perturb_image_tokens(
-                permuted_image_tokens,
+            # 2. Perturb the *cropped* sequence
+            corr_perturbed_tokens, corr_perturbed_indices, prediction_quality, new_token_order = perturb_image_tokens(
+                corr_image_tokens,
                 config.corrector_model.params.vocab_size,
                 supervision_mode=config.training_params.supervision_mode,
                 perturb_mode=config.training_params.perturb_mode,
                 perturb_ratio=config.training_params.perturb_ratio,
                 perturb_num=config.training_params.perturb_num,
                 ar_model=gpt,
-                token_order=token_order,
-                class_tokens=y # Pass class tokens to the wrapper
+                token_order=cropped_token_order, # Pass the cropped token order
+                class_tokens=y
             )
-            # Always update token_order. It will be the new shuffled order in adversarial mode,
-            # or the original order in replacement mode.
+            # The new_token_order from perturb_image_tokens will also be of the cropped size
             token_order = new_token_order
-
-            # prepare tokens and token_order to pass in under partial sequence length mode
-            corr_perturbed_tokens = perturbed_tokens[:, :block_size]
-            corr_perturbed_indices = perturbed_indices[:, :block_size]
             
-            # 2. Get hidden states from the frozen gpt model
+            # 3. Get hidden states from the frozen gpt model using the perturbed cropped sequence
             logits, hidden_states = get_last_n_hidden_states(
                 gpt,
                 corr_perturbed_tokens,
                 cond,
-                token_order,
+                token_order, # This is now the cropped order
                 output_last_n=config.corrector_model.params.num_ar_layers_for_input,
                 device=accelerator.device,
                 block_size=block_size
             )
 
-            # 3. Forward pass through corrector
+            # 4. Forward pass through corrector
             logits = corrector(hidden_states)
             return_value = compute_loss(logits, corr_perturbed_indices)
             
