@@ -34,10 +34,12 @@ training_params:
   full_length_mode: False
   max_iters: 100000
   global_batch_size: 288
-  supervision_mode: "adversarial" # "adversarial" or "replacement"
+  supervision_mode: "confidence_scoring" # "adversarial", "replacement", or "confidence_scoring"
   perturb_mode: "ratio" # "ratio" or "num"
   perturb_ratio: 0.3 # Key hyperparameter for corrector training
   perturb_num: 1
+  # --- Parameters for confidence_scoring mode ---
+  bad_token_rank_threshold_ratio: 0.001 # e.g., 0.001 means tokens not in the top 0.1% are considered "bad".
 
 # Optimization parameters
 optimizer:

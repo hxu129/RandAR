@@ -26,6 +26,7 @@ import os
 import time
 import argparse
 import sys
+from typing import Tuple
 sys.path.append("./")
 import shutil
 import wandb
@@ -57,6 +58,112 @@ def cycle(dl: torch.utils.data.DataLoader):
     while True:
         for data in dl:
             yield data
+
+def generate_and_label_draft_online(
+    gpt_model: RandARTransformer,
+    cond_tokens: torch.Tensor,
+    seq_len: int,
+    block_size: int,
+    bad_token_rank_threshold_ratio: float,
+    device: torch.device,
+    cfg_scales: Tuple[float, float] = (1.0, 1.0),
+    num_inference_steps: int = -1, # Use full autoregressive by default
+    temperature: float = 1.0,
+    top_k: int = 0,
+    top_p: float = 1.0,
+):
+    """
+    在线生成草稿并基于其自身上下文进行标注，为学生模型提供训练数据。
+    该方法基于您的建议，分为两个阶段：
+
+    1.  **生成草稿 (Draft Generation)**:
+        - 直接调用教师模型(gpt_model)的 `.generate()` 方法，使用随机顺序(random order)
+          一次性生成一个批次的“初稿”序列。
+
+    2.  **事后审查与标注 (Review and Label)**:
+        - 对生成的“初稿”进行一次独立的、高效的单次前向传播评估。
+        - 对于初稿中的每一个token，计算它在其他所有token作为上下文的条件下的概率排名。
+        - 如果一个token的概率排名不在最优的top N% (由bad_token_rank_threshold_ratio决定)，
+          则将其标记为“坏”(bad) token。
+
+    Args:
+        gpt_model: 预训练的、冻结的教师模型 (RandARTransformer)。
+        cond_tokens: 条件token (例如类别标签)。
+        seq_len: 生成序列的长度。
+        bad_token_rank_threshold_ratio: 用于判定“坏”token的排名百分比阈值 (例如, 0.001 for top 0.1%)。
+        device: 计算设备。
+        ... (generation-related parameters) ...
+
+    Returns:
+        draft_tokens (torch.Tensor): 生成的“初稿”token序列, shape [bs, seq_len]。
+        labels (torch.Tensor): 每个token对应的“坏”标签 (True表示坏, False表示好), shape [bs, seq_len]。
+    """
+    bs = cond_tokens.shape[0]
+    gpt_model.eval()
+
+    # --- 步骤 1: 使用 .generate() 直接生成草稿 ---
+    # Note: This call activates the KV cache inside the model.
+    with torch.no_grad():
+        # 为生成过程创建随机排列
+        gen_token_order = torch.stack([torch.randperm(seq_len, device=device) for _ in range(bs)])
+
+        draft_tokens = gpt_model.generate(
+            cond=cond_tokens,
+            token_order=gen_token_order,
+            cfg_scales=cfg_scales,
+            num_inference_steps=num_inference_steps,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+        )
+
+    # CRITICAL FIX: Clear the KV cache after generation.
+    # The .generate() call activates the KV cache, which is not needed for the
+    # full forward pass below and would cause a crash because `input_pos` is not provided.
+    gpt_model.remove_caches()
+    
+    # --- 步骤 2: 事后审查与标注 (单次前向传播) ---
+    with torch.no_grad():
+        # 使用全新的随机排列来对“初稿”进行独立的、无偏的评估
+        eval_token_order = torch.stack([torch.randperm(seq_len, device=device) for _ in range(bs)])
+        permuted_draft_tokens = torch.gather(draft_tokens, 1, eval_token_order)[:, :block_size]
+
+        # make bidirectional attention mask
+        no_self_attention_mask = torch.ones(block_size*2+1, block_size*2+1, device=device, dtype=torch.bool)
+        for i in range(block_size*2):
+            no_self_attention_mask[i, i+1] = False
+        
+        # 获取评估的logits
+        eval_logits, _ = get_last_n_hidden_states(
+            gpt_model,
+            permuted_draft_tokens,
+            cond_tokens,
+            eval_token_order,
+            output_last_n=0,
+            device=device,
+            block_size=block_size,
+            mask=no_self_attention_mask
+        )
+        # 提取与图像token对应的logits
+        image_eval_logits = eval_logits[:, gpt_model.cls_token_num::2, :]
+
+        # 计算每个位置上真实token的排名
+        eval_probs = torch.softmax(image_eval_logits, dim=-1)
+        
+        # 获取“初稿”中每个token在被打乱顺序后对应的概率
+        gt_probs_permuted = torch.gather(eval_probs, 2, permuted_draft_tokens.unsqueeze(-1))
+
+        # 排名 = 概率比它大的token的数量。排名0为最好。
+        ranks_permuted = (eval_probs > gt_probs_permuted).sum(dim=-1).float()
+
+        # 计算排名阈值
+        rank_threshold = gpt_model.vocab_size * bad_token_rank_threshold_ratio
+
+        # 如果排名大于阈值，则认为是"坏"token
+        labels_permuted = ranks_permuted > rank_threshold
+
+    return permuted_draft_tokens, labels_permuted, eval_token_order
+
 
 def perturb_image_tokens_adversarial(
     image_tokens: torch.Tensor,
@@ -328,6 +435,7 @@ def get_last_n_hidden_states(
     output_last_n: int,
     device: torch.device,
     block_size: int,
+    mask: torch.Tensor = None,
 ):
     """
     Feeds a sequence through the RandAR model and returns the hidden states
@@ -377,8 +485,8 @@ def get_last_n_hidden_states(
         hidden_states = []
         for layer_idx, layer in enumerate(model.layers):
             # The layer forward in TransformerBlock doesn't use `start_pos` when KV cache is off
-            # We will call it without kv_cache.
-            h_for_inference = layer(h_for_inference, freqs_cis, start_pos=None, mask=None)
+            # We pass the custom mask to control attention behavior (e.g., bidirectional without self-attention).
+            h_for_inference = layer(h_for_inference, freqs_cis, start_pos=None, mask=mask)
             if output_last_n > 0 and layer_idx >= model.n_layer - output_last_n:
                 hidden_states.append(h_for_inference)
         
@@ -795,31 +903,48 @@ def main(args):
         bs = image_tokens.shape[0]
 
         with accelerator.accumulate(corrector):
-            # 1. Prepare token sequence
-            token_order = torch.arange(full_block_size, device=accelerator.device).unsqueeze(0).repeat(bs, 1)
-            for i in range(bs):
-                token_order[i] = token_order[i][torch.randperm(full_block_size, device=accelerator.device)]
+            # 1. Prepare token sequence and labels based on the supervision mode
+            if config.training_params.supervision_mode == "confidence_scoring":
+                # Mode 1: Teacher generates a draft and labels it.
+                corr_perturbed_tokens, corr_perturbed_indices, token_order = generate_and_label_draft_online(
+                    gpt_model=gpt,
+                    cond_tokens=cond,
+                    seq_len=full_block_size,
+                    bad_token_rank_threshold_ratio=config.training_params.bad_token_rank_threshold_ratio,
+                    device=accelerator.device,
+                    # Note: You might want to expose these generation params in the config as well
+                    cfg_scales=(1.0, 1.0), 
+                    temperature=1.0,
+                    top_k=0,
+                    block_size=block_size,
+                )
+
+                prediction_quality = None # Not applicable in this mode
             
-            permuted_image_tokens = torch.gather(image_tokens, 1, token_order)
+            else:
+                # Mode 2 & 3: Perturb existing real data.
+                token_order = torch.arange(full_block_size, device=accelerator.device).unsqueeze(0).repeat(bs, 1)
+                for i in range(bs):
+                    token_order[i] = token_order[i][torch.randperm(full_block_size, device=accelerator.device)]
+                
+                permuted_image_tokens = torch.gather(image_tokens, 1, token_order)
 
-            perturbed_tokens, perturbed_indices, prediction_quality, new_token_order = perturb_image_tokens(
-                permuted_image_tokens,
-                config.corrector_model.params.vocab_size,
-                supervision_mode=config.training_params.supervision_mode,
-                perturb_mode=config.training_params.perturb_mode,
-                perturb_ratio=config.training_params.perturb_ratio,
-                perturb_num=config.training_params.perturb_num,
-                ar_model=gpt,
-                token_order=token_order,
-                class_tokens=y # Pass class tokens to the wrapper
-            )
-            # Always update token_order. It will be the new shuffled order in adversarial mode,
-            # or the original order in replacement mode.
-            token_order = new_token_order
+                perturbed_tokens, perturbed_indices, prediction_quality, new_token_order = perturb_image_tokens(
+                    permuted_image_tokens,
+                    config.corrector_model.params.vocab_size,
+                    supervision_mode=config.training_params.supervision_mode,
+                    perturb_mode=config.training_params.perturb_mode,
+                    perturb_ratio=config.training_params.perturb_ratio,
+                    perturb_num=config.training_params.perturb_num,
+                    ar_model=gpt,
+                    token_order=token_order,
+                    class_tokens=y
+                )
+                token_order = new_token_order
 
-            # prepare tokens and token_order to pass in under partial sequence length mode
-            corr_perturbed_tokens = perturbed_tokens[:, :block_size]
-            corr_perturbed_indices = perturbed_indices[:, :block_size]
+                # prepare tokens and token_order to pass in under partial sequence length mode
+                corr_perturbed_tokens = perturbed_tokens[:, :block_size]
+                corr_perturbed_indices = perturbed_indices[:, :block_size]
             
             # 2. Get hidden states from the frozen gpt model
             logits, hidden_states = get_last_n_hidden_states(
