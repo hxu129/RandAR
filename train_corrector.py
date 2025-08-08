@@ -162,7 +162,21 @@ def generate_and_label_draft_online(
         # 如果排名大于阈值，则认为是"坏"token
         labels_permuted = ranks_permuted > rank_threshold
 
-    return permuted_draft_tokens, labels_permuted, eval_token_order
+        if block_size == seq_len:
+            # --- Calculate average rank per generation step for logging ---
+            # 1. Map ranks from evaluation order back to raster order.
+            inverse_eval_order = torch.argsort(eval_token_order, dim=1)
+            ranks_raster = torch.gather(ranks_permuted, 1, inverse_eval_order)
+
+            # 2. Map ranks from raster order to the original generation order.
+            ranks_generation_order = torch.gather(ranks_raster, 1, gen_token_order)
+
+            # 3. Average across the batch to get the mean rank for each generation step.
+            avg_rank_per_gen_step = ranks_generation_order.mean(dim=0)
+        else:
+            avg_rank_per_gen_step = None
+
+    return permuted_draft_tokens, labels_permuted, eval_token_order, avg_rank_per_gen_step
 
 
 def perturb_image_tokens_adversarial(
@@ -884,6 +898,9 @@ def main(args):
     running_rank_sum = torch.zeros(full_block_size, device=accelerator.device)
     running_rank_count = 0
 
+    running_gen_step_rank_sum = torch.zeros(full_block_size, device=accelerator.device)
+    running_gen_step_rank_count = 0
+
     # Variables for running average of top-k position indices
     running_top_k_pos_idx_sum = {k: torch.zeros(full_block_size, device=torch.device('cpu')) for k in [1, 2, 3, 5, 10, 15]}
     running_top_k_pos_idx_mean = {k: torch.zeros(full_block_size, device=torch.device('cpu')) for k in [1, 2, 3, 5, 10, 15]}
@@ -893,7 +910,7 @@ def main(args):
     logger.info(f"Starting training from iteration {train_steps} to {total_iters}")
     while train_steps < total_iters:
         block_size = full_block_size if config.training_params.full_length_mode else torch.randint(128, 201, (1,)).item()
-        if train_steps % 100 == 0:
+        if train_steps % 250 == 0:
             block_size = full_block_size
         x, y, _ = next(data_loader)
         x = x.to(accelerator.device, non_blocking=True)
@@ -906,7 +923,7 @@ def main(args):
             # 1. Prepare token sequence and labels based on the supervision mode
             if config.training_params.supervision_mode == "confidence_scoring":
                 # Mode 1: Teacher generates a draft and labels it.
-                corr_perturbed_tokens, corr_perturbed_indices, token_order = generate_and_label_draft_online(
+                corr_perturbed_tokens, corr_perturbed_indices, token_order, avg_rank_per_gen_step = generate_and_label_draft_online(
                     gpt_model=gpt,
                     cond_tokens=cond,
                     seq_len=full_block_size,
@@ -1060,6 +1077,21 @@ def main(args):
                             table, "Position", "Average Rank", title="Cumulative Average Rank per Position"
                         )
                 
+                # Log rank per generation step if in confidence_scoring mode
+                if config.training_params.supervision_mode == "confidence_scoring" and avg_rank_per_gen_step is not None:
+                    running_gen_step_rank_sum += avg_rank_per_gen_step
+                    running_gen_step_rank_count += 1
+                    cumulative_avg_gen_step_rank = running_gen_step_rank_sum / running_gen_step_rank_count
+                    
+                    gen_step_data = torch.arange(full_block_size, device=accelerator.device).cpu().numpy()
+                    gen_rank_data = cumulative_avg_gen_step_rank.cpu().numpy()
+                    
+                    gen_step_table_data = [[step, rank] for step, rank in zip(gen_step_data, gen_rank_data)]
+                    gen_step_table = wandb.Table(data=gen_step_table_data, columns=["Generation Step", "Average Rank"])
+                    log_metrics["confidence_scoring/cumulative_rank_per_gen_step"] = wandb.plot.bar(
+                        gen_step_table, "Generation Step", "Average Rank", title="Cumulative Average Rank per Generation Step"
+                    )
+
                 accelerator.log(log_metrics, step=train_steps)
                 
                 running_loss, start_time = 0, time.time()
