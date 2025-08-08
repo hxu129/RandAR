@@ -39,7 +39,7 @@ training_params:
   perturb_ratio: 0.3 # Key hyperparameter for corrector training
   perturb_num: 1
   # --- Parameters for confidence_scoring mode ---
-  bad_token_rank_threshold_ratio: 0.001 # e.g., 0.001 means tokens not in the top 0.1% are considered "bad".
+  bad_token_rank_threshold_ratio: 0.01 # e.g., 0.001 means tokens not in the top 0.1% are considered "bad".
 
 # Optimization parameters
 optimizer:

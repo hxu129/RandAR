@@ -127,25 +127,31 @@ def generate_and_label_draft_online(
         # 使用全新的随机排列来对“初稿”进行独立的、无偏的评估
         eval_token_order = torch.stack([torch.randperm(seq_len, device=device) for _ in range(bs)])
         permuted_draft_tokens = torch.gather(draft_tokens, 1, eval_token_order)[:, :block_size]
+        image_eval_logits = torch.zeros(bs, block_size, gpt_model.vocab_size, device=device)
 
-        # make bidirectional attention mask
-        no_self_attention_mask = torch.ones(block_size*2+1, block_size*2+1, device=device, dtype=torch.bool)
-        for i in range(block_size*2):
-            no_self_attention_mask[i, i+1] = False
-        
-        # 获取评估的logits
-        eval_logits, _ = get_last_n_hidden_states(
-            gpt_model,
-            permuted_draft_tokens,
-            cond_tokens,
-            eval_token_order,
-            output_last_n=0,
-            device=device,
-            block_size=block_size,
-            mask=no_self_attention_mask
-        )
-        # 提取与图像token对应的logits
-        image_eval_logits = eval_logits[:, gpt_model.cls_token_num::2, :]
+        for i in range(bs):
+            for j in range(block_size):
+                # create a new token order for the i-th sample
+                biattention_mask = torch.trilu(torch.ones(block_size*2+1, block_size*2+1, device=device, dtype=torch.bool), diagonal=0)
+                biattention_mask[:, 2*j+1:2*j+3] = False
+                biattention_mask[2*j+1:2*j+3, :] = True
+                biattention_mask[2*j+1, 2*j+2] = False
+                biattention_mask[2*j+2, 2*j+1] = False
+
+                # get the logits
+                eval_logits, _ = get_last_n_hidden_states(
+                    gpt_model,
+                    permuted_draft_tokens,
+                    cond_tokens,
+                    eval_token_order,
+                    output_last_n=0,
+                    device=device,
+                    block_size=block_size,
+                    mask=biattention_mask
+                )
+
+                # get the image logits
+                image_eval_logits[i, j, :] = eval_logits[i, 2*j+1, :]
 
         # 计算每个位置上真实token的排名
         eval_probs = torch.softmax(image_eval_logits, dim=-1)
@@ -909,7 +915,7 @@ def main(args):
 
     logger.info(f"Starting training from iteration {train_steps} to {total_iters}")
     while train_steps < total_iters:
-        block_size = full_block_size if config.training_params.full_length_mode else torch.randint(128, 201, (1,)).item()
+        block_size = full_block_size if config.training_params.full_length_mode else torch.randint(170, full_block_size+1, (1,)).item()
         if train_steps % 250 == 0:
             block_size = full_block_size
         x, y, _ = next(data_loader)
@@ -1024,6 +1030,10 @@ def main(args):
                     "time": average_time,
                     "block_size": block_size
                 }
+
+                if config.training_params.supervision_mode == "confidence_scoring":
+                    log_metrics["average_perturbation_number"] = corr_perturbed_indices.sum().item() / bs
+                    print(f"Average perturbation number: {log_metrics['average_perturbation_number']}")
 
                 if block_size == full_block_size:
                     # Log top-k position indices
