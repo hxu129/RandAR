@@ -86,6 +86,7 @@ def compute_fid_cov_1nna(ref_batch, sample_batch):
     )
 
     print("Computing evaluations...")
+    IS = evaluator.compute_inception_score(sample_acts[0])
     FID = sample_stats.frechet_distance(ref_stats)
     sFID = sample_stats_spatial.frechet_distance(ref_stats_spatial)
     print("Inception Score:", IS)
@@ -95,7 +96,7 @@ def compute_fid_cov_1nna(ref_batch, sample_batch):
     print("Precision:", prec)
     print("Recall:", recall)
     one_nna = evaluator.compute_1nna(sample_acts, ref_acts)
-    IS = evaluator.compute_inception_score(sample_acts[0])
+    cov = evaluator.compute_cov(sample_acts, ref_acts)
     print("Coverage:", cov)
     print("1-NNA:", one_nna)
 
