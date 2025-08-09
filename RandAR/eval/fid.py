@@ -110,6 +110,7 @@ def compute_fid_cov_1nna(ref_batch, sample_batch):
         print("Recall:", recall, file=f)
         print("Coverage:", cov, file=f)
         print("1-NNA:", one_nna, file=f)
+    return FID, sFID, IS, prec, recall, cov, one_nna
 
 
 def compute_fid(ref_batch, sample_batch):
