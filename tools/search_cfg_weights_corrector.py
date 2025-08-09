@@ -24,7 +24,7 @@ from RandAR.dataset.builder import build_dataset
 from RandAR.utils.distributed import init_distributed_mode, is_main_process
 from RandAR.dataset.augmentation import center_crop_arr
 from RandAR.util import instantiate_from_config, load_safetensors
-from RandAR.eval.fid import compute_fid
+from RandAR.eval.fid import compute_fid, compute_fid_cov_1nna
 
 
 def create_npz_from_sample_folder(sample_dir, num=50_000):
@@ -129,8 +129,8 @@ def sample_and_eval(tokenizer, gpt_model, corrector_model, cfg_scale, args, devi
     dist.barrier()
     dist.destroy_process_group()
 
-    fid, sfid, IS, precision, recall = compute_fid(args.ref_path, sample_path)
-    return fid, sfid, IS, precision, recall
+    fid, sfid, IS, precision, recall, cov, one_nna = compute_fid_cov_1nna(args.ref_path, sample_path)
+    return fid, sfid, IS, precision, recall, cov, one_nna
 
 
 def main(args):
@@ -213,14 +213,16 @@ def main(args):
 
         # run throught the CFG scales
         for cfg_scale in cfg_scales_list:
-            fid, sfid, IS, precision, recall = sample_and_eval(
+            fid, sfid, IS, precision, recall, cov, one_nna = sample_and_eval(
                 tokenizer, gpt_model, corrector_model, cfg_scale, args, device, total_samples, corrector_config.corrector_model.params.num_ar_layers_for_input)
             eval_results[f"{cfg_scale:.2f}"] = {
                 "fid": fid,
                 "sfid": sfid,
                 "IS": IS,
                 "precision": precision,
-                "recall": recall
+                "recall": recall,
+                "cov": cov,
+                "one_nna": one_nna
             }
             print(f"Eval results for CFG scale {cfg_scale:.2f}: {eval_results[f'{cfg_scale:.2f}']}")
 
@@ -234,7 +236,7 @@ def main(args):
     corrector_model.eval()
     tokenizer.eval()
     with torch.no_grad() and torch.inference_mode() and torch.autocast(device_type="cuda", dtype=precision):
-        fid, sfid, IS, precision, recall = sample_and_eval(
+        fid, sfid, IS, precision, recall, cov, one_nna = sample_and_eval(
             tokenizer, gpt_model, corrector_model, optimal_cfg_scale, args, device, total_samples, corrector_config.corrector_model.params.num_ar_layers_for_input)
     
     print(f"Optimal CFG scale: {optimal_cfg_scale:.2f}")
@@ -244,7 +246,9 @@ def main(args):
         "sfid": sfid,
         "IS": IS,
         "precision": precision,
-        "recall": recall
+        "recall": recall,
+        "cov": cov,
+        "one_nna": one_nna
     }
 
     with open(result_file_name, "w") as f:

@@ -26,6 +26,92 @@ INCEPTION_V3_PATH = "classify_image_graph_def.pb"
 FID_POOL_NAME = "pool_3:0"
 FID_SPATIAL_NAME = "mixed_6/conv:0"
 
+def compute_cov_1nna(ref_batch, sample_batch):
+    config = tf.ConfigProto(
+        allow_soft_placement=True  # allows DecodeJpeg to run on CPU in Inception graph
+    )
+    config.gpu_options.allow_growth = True
+    evaluator = Evaluator(tf.Session(config=config))
+
+    print("warming up TensorFlow...")
+    # This will cause TF to print a bunch of verbose stuff now rather
+    # than after the next print(), to help prevent confusion.
+    evaluator.warmup()
+
+    print("computing reference batch activations...")
+    ref_acts, ref_acts_spatial = evaluator.read_activations(ref_batch)
+    print("computing sample batch activations...")
+    sample_acts, sample_acts_spatial = evaluator.read_activations(sample_batch)
+
+    print("Computing evaluations...")
+    
+    print("Computing COV...")
+    cov = evaluator.compute_cov(sample_acts, ref_acts)
+    print("Coverage:", cov)
+
+    print("Computing 1-NNA...")
+    one_nna = evaluator.compute_1nna(sample_acts, ref_acts)
+    print("1-NNA:", one_nna)
+
+    txt_path = sample_batch.replace(".npz", "_metrics.txt")
+    print("writing to {}".format(txt_path))
+    with open(txt_path, "w") as f:
+        print("Coverage:", cov, file=f)
+        print("1-NNA:", one_nna, file=f)
+
+    return cov, one_nna
+
+def compute_fid_cov_1nna(ref_batch, sample_batch):
+    config = tf.ConfigProto(
+        allow_soft_placement=True  # allows DecodeJpeg to run on CPU in Inception graph
+    )
+    config.gpu_options.allow_growth = True
+    evaluator = Evaluator(tf.Session(config=config))
+
+    print("warming up TensorFlow...")
+    # This will cause TF to print a bunch of verbose stuff now rather
+    # than after the next print(), to help prevent confusion.
+    evaluator.warmup()
+
+    print("computing reference batch activations...")
+    ref_acts = evaluator.read_activations(ref_batch)
+    print("computing/reading reference batch statistics...")
+    ref_stats, ref_stats_spatial = evaluator.read_statistics(ref_batch, ref_acts)
+
+    print("computing sample batch activations...")
+    sample_acts = evaluator.read_activations(sample_batch)
+    print("computing/reading sample batch statistics...")
+    sample_stats, sample_stats_spatial = evaluator.read_statistics(
+        sample_batch, sample_acts
+    )
+
+    print("Computing evaluations...")
+    IS = evaluator.compute_inception_score(sample_acts[0])
+    FID = sample_stats.frechet_distance(ref_stats)
+    sFID = sample_stats_spatial.frechet_distance(ref_stats_spatial)
+    print("Inception Score:", IS)
+    print("FID:", FID)
+    print("sFID:", sFID)
+    prec, recall = evaluator.compute_prec_recall(ref_acts[0], sample_acts[0])
+    print("Precision:", prec)
+    print("Recall:", recall)
+    one_nna = evaluator.compute_1nna(sample_acts, ref_acts)
+    cov = evaluator.compute_cov(sample_acts, ref_acts)
+    print("Coverage:", cov)
+    print("1-NNA:", one_nna)
+
+    txt_path = sample_batch.replace(".npz", ".txt")
+    print("writing to {}".format(txt_path))
+    with open(txt_path, "w") as f:
+        print("Inception Score:", IS, file=f)
+        print("FID:", FID, file=f)
+        print("sFID:", sFID, file=f)
+        print("Precision:", prec, file=f)
+        print("Recall:", recall, file=f)
+        print("Coverage:", cov, file=f)
+        print("1-NNA:", one_nna, file=f)
+    return FID, sFID, IS, prec, recall, cov, one_nna
+
 
 def compute_fid(ref_batch, sample_batch):
     config = tf.ConfigProto(
@@ -275,6 +361,55 @@ class Evaluator:
             activations_ref, radii_1, activations_sample, radii_2
         )
         return (float(pr[0][0]), float(pr[1][0]))
+
+    def compute_cov(self, Sg, Sr):
+        """
+        Computes coverage given two sets of samples, Sg and Sr.
+        Sg: generated samples
+        Sr: reference samples
+        """
+        distances = self.manifold_estimator.distance_block.pairwise_distances(Sg, Sr)
+        min_distances = np.min(distances, axis=1)
+        
+        # According to the formula, we need to find the argmin for each X in Sg.
+        # The coverage is the size of the set of these argmins divided by the size of Sr.
+        # The set of argmins is the set of indices of the nearest neighbors in Sr for each sample in Sg.
+        nearest_neighbor_indices = np.argmin(distances, axis=1)
+        
+        # The number of unique nearest neighbors.
+        coverage = len(np.unique(nearest_neighbor_indices)) / len(Sr)
+        return coverage
+
+    def compute_1nna(self, Sg, Sr):
+        """
+        Computes 1-NNA accuracy given two sets of samples, Sg and Sr.
+        """
+        # Create labels: 0 for Sg, 1 for Sr
+        labels_Sg = np.zeros(len(Sg))
+        labels_Sr = np.ones(len(Sr))
+        labels = np.concatenate([labels_Sg, labels_Sr])
+        
+        S_all = np.concatenate([Sg, Sr], axis=0)
+        
+        # Pairwise distances between all samples
+        distances = self.manifold_estimator.distance_block.pairwise_distances(S_all, S_all)
+        
+        # Ensure self-distance is infinite
+        np.fill_diagonal(distances, np.inf)
+
+        # Distances for Sg samples to all other samples
+        dist_sg_all = distances[:len(Sg), :]
+        nn_sg_indices = np.argmin(dist_sg_all, axis=1)
+        # Check if nearest neighbor is from Sg (label 0)
+        acc_sg = np.sum(labels[nn_sg_indices] == 0)
+
+        # Distances for Sr samples to all other samples
+        dist_sr_all = distances[len(Sg):, :]
+        nn_sr_indices = np.argmin(dist_sr_all, axis=1)
+        # Check if nearest neighbor is from Sr (label 1)
+        acc_sr = np.sum(labels[nn_sr_indices] == 1)
+
+        return (acc_sg + acc_sr) / (len(Sg) + len(Sr))
 
 
 class ManifoldEstimator:
