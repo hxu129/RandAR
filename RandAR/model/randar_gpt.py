@@ -836,8 +836,23 @@ class RandARTransformer(nn.Module):
                     # Step 6-3: Select tokens to correct
                     # Sort indices by error score in descending order (most likely error first)
                     error_pos = torch.topk(corr_logits, k=num_errors, dim=-1, largest=True)[1]
-                    non_error_pos = torch.stack([torch.tensor([j for j in range(query_token_idx_cur_step) if j not in error_pos[i]]) for i in range(corr_bs)]).to(cond.device)
-                
+
+                    # Create a boolean mask for all positions and scatter True for error positions
+                    error_mask = torch.zeros(corr_bs, query_token_idx_cur_step, dtype=torch.bool, device=cond.device)
+                    error_mask.scatter_(1, error_pos, True)
+
+                    # Invert the mask to get non-error positions
+                    non_error_mask = ~error_mask
+                    
+                    # A fully vectorized approach to get non_error_pos without list comprehension.
+                    all_positions = torch.arange(query_token_idx_cur_step, device=cond.device).expand(corr_bs, -1)
+                    # Set error positions to a large value so they are sorted to the end
+                    masked_positions = torch.where(non_error_mask, all_positions, query_token_idx_cur_step)
+                    sorted_positions = torch.sort(masked_positions, dim=1)[0]
+                    
+                    # Slice to get the non-error positions. The number of non-errors is the total minus the number of errors.
+                    num_non_errors = query_token_idx_cur_step - num_errors
+                    non_error_pos = sorted_positions[:, :num_non_errors]
 
                     # Step 6-4: Update the token order and the tokens
                     # Combine non-error and error positions to create a single reordering map.
