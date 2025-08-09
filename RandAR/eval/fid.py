@@ -62,7 +62,53 @@ def compute_cov_1nna(ref_batch, sample_batch):
     return cov, one_nna
 
 def compute_fid_cov_1nna(ref_batch, sample_batch):
-    return compute_fid(ref_batch, sample_batch), compute_cov_1nna(ref_batch, sample_batch)
+    config = tf.ConfigProto(
+        allow_soft_placement=True  # allows DecodeJpeg to run on CPU in Inception graph
+    )
+    config.gpu_options.allow_growth = True
+    evaluator = Evaluator(tf.Session(config=config))
+
+    print("warming up TensorFlow...")
+    # This will cause TF to print a bunch of verbose stuff now rather
+    # than after the next print(), to help prevent confusion.
+    evaluator.warmup()
+
+    print("computing reference batch activations...")
+    ref_acts = evaluator.read_activations(ref_batch)
+    print("computing/reading reference batch statistics...")
+    ref_stats, ref_stats_spatial = evaluator.read_statistics(ref_batch, ref_acts)
+
+    print("computing sample batch activations...")
+    sample_acts = evaluator.read_activations(sample_batch)
+    print("computing/reading sample batch statistics...")
+    sample_stats, sample_stats_spatial = evaluator.read_statistics(
+        sample_batch, sample_acts
+    )
+
+    print("Computing evaluations...")
+    FID = sample_stats.frechet_distance(ref_stats)
+    sFID = sample_stats_spatial.frechet_distance(ref_stats_spatial)
+    print("Inception Score:", IS)
+    print("FID:", FID)
+    print("sFID:", sFID)
+    prec, recall = evaluator.compute_prec_recall(ref_acts[0], sample_acts[0])
+    print("Precision:", prec)
+    print("Recall:", recall)
+    one_nna = evaluator.compute_1nna(sample_acts, ref_acts)
+    IS = evaluator.compute_inception_score(sample_acts[0])
+    print("Coverage:", cov)
+    print("1-NNA:", one_nna)
+
+    txt_path = sample_batch.replace(".npz", ".txt")
+    print("writing to {}".format(txt_path))
+    with open(txt_path, "w") as f:
+        print("Inception Score:", IS, file=f)
+        print("FID:", FID, file=f)
+        print("sFID:", sFID, file=f)
+        print("Precision:", prec, file=f)
+        print("Recall:", recall, file=f)
+        print("Coverage:", cov, file=f)
+        print("1-NNA:", one_nna, file=f)
 
 
 def compute_fid(ref_batch, sample_batch):
