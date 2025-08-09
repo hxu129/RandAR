@@ -95,8 +95,8 @@ def compute_fid_cov_1nna(ref_batch, sample_batch):
     prec, recall = evaluator.compute_prec_recall(ref_acts[0], sample_acts[0])
     print("Precision:", prec)
     print("Recall:", recall)
-    one_nna = evaluator.compute_1nna(sample_acts, ref_acts)
-    cov = evaluator.compute_cov(sample_acts, ref_acts)
+    one_nna = evaluator.compute_1nna(sample_acts[0], ref_acts[0])
+    cov = evaluator.compute_cov(sample_acts[0], ref_acts[0])
     print("Coverage:", cov)
     print("1-NNA:", one_nna)
 
